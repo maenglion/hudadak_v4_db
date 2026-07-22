@@ -256,6 +256,8 @@ async def nearest(
               dl.display_ts
             FROM air.stations s
             JOIN air.dashboard_latest dl ON dl.station_id = s.id
+            WHERE dl.source_quality IS DISTINCT FROM 'model'
+              AND dl.display_ts >= NOW() - INTERVAL '24 hours'
             ORDER BY ST_Distance(s.geom, (SELECT g FROM target)) ASC
             LIMIT 1;
             """
