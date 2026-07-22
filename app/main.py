@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor
 import psycopg2
 from datetime import datetime, timedelta, timezone
-import os, asyncio, httpx
+import os, asyncio, json, httpx
 from routers import geo_router
 
 # --- FastAPI 앱 ---
@@ -133,6 +133,14 @@ POLLUTANT_KEYS = [
     "carbon_monoxide",
 ]
 
+# 실측 PM 응답에 보충할 Open-Meteo 가스 지표
+GAS_KEYS = [
+    "ozone",
+    "nitrogen_dioxide",
+    "sulphur_dioxide",
+    "carbon_monoxide",
+]
+
 # 바람/강수 키
 MET_KEYS = [
     "wind_speed_10m",
@@ -223,6 +231,56 @@ def _pick_latest(aq_json: Dict[str, Any]) -> Dict[str, Any]:
         "co":  pick("carbon_monoxide"),
     }
 
+def _fetch_owm_gas_backup(conn, lat: float, lon: float) -> Dict[str, Any]:
+    """가장 가까운 OWM 지점의 최근 저장 가스 농도를 영속 백업으로 읽는다."""
+    q = """
+    WITH target AS (
+      SELECT ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography AS g
+    )
+    SELECT
+      s.name,
+      m.ts AS display_ts,
+      m.raw
+    FROM air.stations s
+    JOIN LATERAL (
+      SELECT ts, raw
+      FROM air.measurements
+      WHERE station_id = s.id
+        AND ts <= NOW() + INTERVAL '30 minutes'
+        AND ts >= NOW() - INTERVAL '24 hours'
+      ORDER BY ts DESC
+      LIMIT 1
+    ) m ON TRUE
+    WHERE UPPER(s.provider) = 'OWM'
+    ORDER BY ST_Distance(s.geom, (SELECT g FROM target)) ASC
+    LIMIT 1;
+    """
+    with conn.cursor() as cur:
+        cur.execute(q, (lon, lat))
+        row = cur.fetchone()
+        if row and not isinstance(row, dict):
+            cols = [d[0] for d in cur.description]
+            row = dict(zip(cols, row))
+
+    if not row:
+        return {}
+
+    raw = row.get("raw") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = {}
+    components = raw.get("components") or {}
+    return {
+        "display_ts": row.get("display_ts"),
+        "name": row.get("name"),
+        "o3": components.get("o3"),
+        "no2": components.get("no2"),
+        "so2": components.get("so2"),
+        "co": components.get("co"),
+    }
+
 # =======================================
 #  /nearest : DB 우선 → Open-Meteo 폴백
 # =======================================
@@ -268,6 +326,40 @@ async def nearest(
                     cols = [d[0] for d in cur.description]
                     row = dict(zip(cols, row))
             if row:
+                # PM은 최근접 측정소 실측값을 유지하고, DB에 없는 가스 지표만
+                # 요청 좌표 기준 Open-Meteo 모델값으로 보충한다.
+                gas = {
+                    "display_ts": None,
+                    "o3": None,
+                    "no2": None,
+                    "so2": None,
+                    "co": None,
+                }
+                gas_providers = set()
+                try:
+                    gas_aq = await cached_fetch_openmeteo(lat, lon, keys=GAS_KEYS)
+                    gas.update(_pick_latest(gas_aq))
+                    if any(gas.get(k) is not None for k in ("o3", "no2", "so2", "co")):
+                        gas_providers.add("OPENMETEO")
+                except Exception as e:
+                    print(f"[nearest] Open-Meteo gas supplement failed: {e}")
+
+                # Open-Meteo 호출 실패 또는 일부 결측은 DB에 저장된 최근 OWM
+                # 농도로 채워 앱에 빈 가스 지표가 노출되지 않게 한다.
+                missing_gases = [k for k in ("o3", "no2", "so2", "co") if gas.get(k) is None]
+                owm_gas = {}
+                if missing_gases:
+                    try:
+                        owm_gas = _fetch_owm_gas_backup(conn, lat, lon)
+                        for key in missing_gases:
+                            if owm_gas.get(key) is not None:
+                                gas[key] = owm_gas[key]
+                                gas_providers.add("OWM")
+                        if not gas.get("display_ts"):
+                            gas["display_ts"] = owm_gas.get("display_ts")
+                    except Exception as e:
+                        print(f"[nearest] OWM gas backup failed: {e}")
+
                 result = {
                     "provider": row.get("provider") or "AIRKOREA",
                     "name": row.get("name"),
@@ -277,7 +369,14 @@ async def nearest(
                     "pm25": row.get("pm25"),
                     "unit_pm10": row.get("unit_pm10") or "µg/m³",
                     "unit_pm25": row.get("unit_pm25") or "µg/m³",
-                    "o3": None, "no2": None, "so2": None, "co": None,
+                    "o3": gas.get("o3"),
+                    "no2": gas.get("no2"),
+                    "so2": gas.get("so2"),
+                    "co": gas.get("co"),
+                    "gas_provider": "+".join(sorted(gas_providers)) or None,
+                    "gas_source_kind": "model",
+                    "gas_display_ts": gas.get("display_ts"),
+                    "gas_station": owm_gas.get("name") if "OWM" in gas_providers else None,
                     "source_kind": row.get("kind") or "airkorea_station",
                     "lat": row.get("lat"), "lon": row.get("lon"),
                     "station": {
