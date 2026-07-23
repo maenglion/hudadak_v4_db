@@ -326,8 +326,42 @@ async def nearest(
                     cols = [d[0] for d in cur.description]
                     row = dict(zip(cols, row))
             if row:
-                # PM은 최근접 측정소 실측값을 유지하고, DB에 없는 가스 지표만
-                # 요청 좌표 기준 Open-Meteo 모델값으로 보충한다.
+                # 위젯의 source=db 요청은 DB의 PM 데이터만 반환한다.
+                # 앱의 source=auto 요청은 기존 가스 보충 동작을 유지한다.
+                if source == "db":
+                    result = {
+                        "provider": row.get("provider"),
+                        "name": row.get("name"),
+                        "station_id": row.get("station_id"),
+                        "display_ts": row.get("display_ts"),
+                        "pm10": row.get("pm10"),
+                        "pm25": row.get("pm25"),
+                        "unit_pm10": row.get("unit_pm10") or "µg/m³",
+                        "unit_pm25": row.get("unit_pm25") or "µg/m³",
+                        "o3": None,
+                        "no2": None,
+                        "so2": None,
+                        "co": None,
+                        "gas_provider": None,
+                        "gas_source_kind": None,
+                        "gas_display_ts": None,
+                        "gas_station": None,
+                        "source_kind": row.get("kind"),
+                        "lat": row.get("lat"),
+                        "lon": row.get("lon"),
+                        "station": {
+                            "name": row.get("name"),
+                            "provider": row.get("provider"),
+                            "kind": row.get("kind"),
+                        },
+                        "source": "db",
+                    }
+                    result["cai_grade"] = _kr_grade_from_pm(
+                        result["pm10"], result["pm25"]
+                    )
+                    result["badges"] = generate_badges(result)
+                    return result
+
                 gas = {
                     "display_ts": None,
                     "o3": None,
@@ -361,7 +395,7 @@ async def nearest(
                         print(f"[nearest] OWM gas backup failed: {e}")
 
                 result = {
-                    "provider": row.get("provider") or "AIRKOREA",
+                    "provider": row.get("provider"),
                     "name": row.get("name"),
                     "station_id": row.get("station_id"),
                     "display_ts": row.get("display_ts"),
@@ -374,10 +408,10 @@ async def nearest(
                     "so2": gas.get("so2"),
                     "co": gas.get("co"),
                     "gas_provider": "+".join(sorted(gas_providers)) or None,
-                    "gas_source_kind": "model",
+                    "gas_source_kind": "model" if gas_providers else None,
                     "gas_display_ts": gas.get("display_ts"),
                     "gas_station": owm_gas.get("name") if "OWM" in gas_providers else None,
-                    "source_kind": row.get("kind") or "airkorea_station",
+                    "source_kind": row.get("kind"),
                     "lat": row.get("lat"), "lon": row.get("lon"),
                     "station": {
                         "name": row.get("name"),
@@ -417,6 +451,8 @@ async def nearest(
         "no2": latest["no2"],
         "so2": latest["so2"],
         "co": latest["co"],
+        "gas_provider": "OPENMETEO",
+        "gas_source_kind": "model",
         "source_kind": "model",
         "lat": lat, "lon": lon,
         "station": {"name": "Open-Meteo", "provider": "OPENMETEO", "kind": "model"},
