@@ -309,13 +309,26 @@ async def nearest(
               s.kind,
               s.lat, s.lon,
               ST_Distance(s.geom, (SELECT g FROM target)) AS distance_m,
-              dl.pm10, dl.pm25,
-              dl.unit_pm10, dl.unit_pm25,
-              dl.display_ts
+              current_pm.pm10, current_pm.pm25,
+              current_pm.unit_pm10, current_pm.unit_pm25,
+              current_pm.display_ts
             FROM air.stations s
-            JOIN air.dashboard_latest dl ON dl.station_id = s.id
-            WHERE dl.source_quality IS DISTINCT FROM 'model'
-              AND dl.display_ts >= NOW() - INTERVAL '24 hours'
+            JOIN LATERAL (
+              SELECT
+                m.pm10,
+                m.pm25,
+                m.unit_pm10,
+                m.unit_pm25,
+                m.ts AS display_ts
+              FROM air.measurements m
+              WHERE m.station_id = s.id
+                AND m.ts <= CURRENT_TIMESTAMP
+                AND m.ts >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                AND m.source_quality IS DISTINCT FROM 'model'
+                AND (m.pm10 IS NOT NULL OR m.pm25 IS NOT NULL)
+              ORDER BY m.ts DESC
+              LIMIT 1
+            ) current_pm ON TRUE
             ORDER BY ST_Distance(s.geom, (SELECT g FROM target)) ASC
             LIMIT 1;
             """
