@@ -95,10 +95,7 @@ class MeasurementCursor(FakeCursor):
         assert "m.source_quality IS DISTINCT FROM 'model'" in normalized_query
         assert "(m.pm10 IS NOT NULL OR m.pm25 IS NOT NULL)" in normalized_query
         assert "ORDER BY m.ts DESC" in normalized_query
-        assert (
-            "ORDER BY current_pm.display_ts DESC, s.distance_m ASC"
-            in normalized_query
-        )
+        assert "ORDER BY s.display_ts DESC, s.distance_m ASC" in normalized_query
 
         eligible = [
             measurement
@@ -153,16 +150,10 @@ class CandidateCursor(FakeCursor):
         assert "m.ts <= CURRENT_TIMESTAMP" in normalized_query
         assert "m.source_quality IS DISTINCT FROM 'model'" in normalized_query
         assert "(m.pm10 IS NOT NULL OR m.pm25 IS NOT NULL)" in normalized_query
-        assert (
-            "ORDER BY current_pm.display_ts DESC, s.distance_m ASC"
-            in normalized_query
-        )
+        assert "ORDER BY s.display_ts DESC, s.distance_m ASC" in normalized_query
 
-        nearby = sorted(
-            self.stations, key=lambda station: station["distance_m"]
-        )[:10]
         candidates = []
-        for station in nearby:
+        for station in self.stations:
             eligible = [
                 measurement
                 for measurement in self.measurements
@@ -188,6 +179,9 @@ class CandidateCursor(FakeCursor):
                 }
             )
 
+        candidates = sorted(
+            candidates, key=lambda candidate: candidate["distance_m"]
+        )[:10]
         self.row = (
             max(
                 candidates,
@@ -649,6 +643,66 @@ class NearestTests(unittest.TestCase):
         self.assertEqual(response["provider"], "WAQI")
         self.assertEqual(response["name"], "Near WAQI")
         self.assertEqual(response["display_ts"], shared_ts)
+
+    def test_model_only_stations_do_not_displace_observed_candidate(self):
+        current_time = datetime(
+            2026, 7, 24, 21, 0, tzinfo=timezone(timedelta(hours=9))
+        )
+        stations = [
+            {
+                "station_id": index,
+                "name": f"Model {index}",
+                "provider": "OWM",
+                "kind": "model",
+                "lat": 37.3925,
+                "lon": 126.6399,
+                "distance_m": float(index * 10),
+            }
+            for index in range(1, 12)
+        ]
+        stations.append(
+            {
+                "station_id": 99,
+                "name": "Aam, Incheon",
+                "provider": "WAQI",
+                "kind": "station",
+                "lat": 37.40508,
+                "lon": 126.63227,
+                "distance_m": 1500.0,
+            }
+        )
+        measurements = [
+            {
+                "station_id": station["station_id"],
+                "ts": current_time,
+                "pm10": 15.0,
+                "pm25": 10.0,
+                "source_quality": "model",
+            }
+            for station in stations[:-1]
+        ]
+        measurements.append(
+            {
+                "station_id": 99,
+                "ts": current_time - timedelta(hours=1),
+                "pm10": 34.0,
+                "pm25": 78.0,
+                "source_quality": "observed",
+            }
+        )
+        connection = CandidateConnection(
+            stations, measurements, current_time
+        )
+
+        with patch.object(
+            main, "get_db_connection", return_value=connection
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.3925, lon=126.6399, source="db")
+            )
+
+        self.assertEqual(response["provider"], "WAQI")
+        self.assertEqual(response["name"], "Aam, Incheon")
 
 
 if __name__ == "__main__":
