@@ -74,6 +74,23 @@ class IngesterTests(unittest.TestCase):
             "AIRKOREA_인천_송도",
         )
 
+    def test_station_list_filters_to_requested_metropolitan_region(self):
+        self.assertTrue(
+            airkorea_common.station_belongs_to_region(
+                "광주", {"addr": "광주광역시 북구 첨단과기로"}
+            )
+        )
+        self.assertFalse(
+            airkorea_common.station_belongs_to_region(
+                "광주", {"addr": "경기도 광주시 중앙로"}
+            )
+        )
+        self.assertFalse(
+            airkorea_common.station_belongs_to_region(
+                "광주", {"addr": "전라남도 광양시 중마로"}
+            )
+        )
+
     def test_airkorea_hourly_runs_retention_after_collection(self):
         script = (ROOT_DIR / "airkorea-hourly.sh").read_text(
             encoding="utf-8"

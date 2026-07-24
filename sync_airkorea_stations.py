@@ -5,6 +5,7 @@ from airkorea_common import (
     ensure_usage_table,
     get_db_connection,
     request_json,
+    station_belongs_to_region,
     station_external_code,
 )
 
@@ -36,8 +37,12 @@ def fetch_region_stations(conn, region, decode_key=False):
 def upsert_stations(conn, region, items):
     upserted = 0
     skipped_without_coordinates = 0
+    skipped_outside_region = 0
     with conn.cursor() as cur:
         for item in items:
+            if not station_belongs_to_region(region, item):
+                skipped_outside_region += 1
+                continue
             station_name = (item.get("stationName") or "").strip()
             lat = to_coordinate(item.get("dmX"))
             lon = to_coordinate(item.get("dmY"))
@@ -82,7 +87,7 @@ def upsert_stations(conn, region, items):
             )
             upserted += 1
     conn.commit()
-    return upserted, skipped_without_coordinates
+    return upserted, skipped_without_coordinates, skipped_outside_region
 
 
 def main():
@@ -119,15 +124,18 @@ def main():
                         .get("items")
                         or []
                     )
-                    upserted, missing_coordinates = upsert_stations(
-                        conn, region, items
-                    )
+                    (
+                        upserted,
+                        missing_coordinates,
+                        outside_region,
+                    ) = upsert_stations(conn, region, items)
                     succeeded_regions += 1
                     total_upserted += upserted
                     print(
                         f"AIRKOREA station sync OK: region={region}, "
                         f"stations={upserted}, "
-                        f"missing_coordinates={missing_coordinates}"
+                        f"missing_coordinates={missing_coordinates}, "
+                        f"outside_region={outside_region}"
                     )
                     last_error = None
                     break

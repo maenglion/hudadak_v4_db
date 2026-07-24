@@ -25,6 +25,16 @@ TARGET_REGIONS = (
     "울산",
     "세종",
 )
+REGION_ADDRESS_PREFIXES = {
+    "서울": ("서울특별시",),
+    "부산": ("부산광역시",),
+    "대구": ("대구광역시",),
+    "인천": ("인천광역시",),
+    "광주": ("광주광역시",),
+    "대전": ("대전광역시",),
+    "울산": ("울산광역시",),
+    "세종": ("세종특별자치시", "세종특별자치시"),
+}
 DAILY_CALL_HARD_CAP = 400
 KST = ZoneInfo("Asia/Seoul")
 
@@ -48,6 +58,14 @@ def station_external_code(region, station_name):
         f"AIRKOREA_{normalize_station_name(region)}_"
         f"{normalize_station_name(station_name)}"
     )
+
+
+def station_belongs_to_region(region, item):
+    address = unicodedata.normalize(
+        "NFKC", str((item or {}).get("addr") or "")
+    ).strip()
+    prefixes = REGION_ADDRESS_PREFIXES.get(region, ())
+    return any(address.startswith(prefix) for prefix in prefixes)
 
 
 def ensure_usage_table(conn):
