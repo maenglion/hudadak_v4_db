@@ -95,6 +95,24 @@ class IngesterTests(unittest.TestCase):
                 "광주", {"addr": "전라남도 광양시 중마로"}
             )
         )
+        self.assertTrue(
+            airkorea_common.station_belongs_to_region(
+                "광주",
+                {"addr": "전남광주통합특별시 광산구 하남산단로"},
+            )
+        )
+        self.assertFalse(
+            airkorea_common.station_belongs_to_region(
+                "광주",
+                {"addr": "전남광주통합특별시 광양시 중마로"},
+            )
+        )
+        self.assertFalse(
+            airkorea_common.station_belongs_to_region(
+                "광주",
+                {"addr": "전남광주통합특별시 광주시 중앙로"},
+            )
+        )
 
     def test_airkorea_hourly_runs_retention_after_collection(self):
         script = (ROOT_DIR / "airkorea-hourly.sh").read_text(

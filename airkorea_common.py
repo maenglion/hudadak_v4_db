@@ -35,6 +35,7 @@ REGION_ADDRESS_PREFIXES = {
     "울산": ("울산광역시", "울산 "),
     "세종": ("세종특별자치시", "세종 "),
 }
+GWANGJU_CORE_DISTRICTS = {"동구", "서구", "남구", "북구", "광산구"}
 DAILY_CALL_HARD_CAP = 400
 KST = ZoneInfo("Asia/Seoul")
 
@@ -64,6 +65,12 @@ def station_belongs_to_region(region, item):
     address = unicodedata.normalize(
         "NFKC", str((item or {}).get("addr") or "")
     ).strip()
+    if region == "광주" and address.startswith("전남광주통합특별시 "):
+        address_parts = address.split()
+        return (
+            len(address_parts) > 1
+            and address_parts[1] in GWANGJU_CORE_DISTRICTS
+        )
     prefixes = REGION_ADDRESS_PREFIXES.get(region, ())
     return any(address.startswith(prefix) for prefix in prefixes)
 
