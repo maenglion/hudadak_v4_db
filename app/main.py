@@ -79,6 +79,43 @@ def get_db_connection():
         print("🔥 DATABASE CONNECTION FAILED:", e)
         return None
 
+def delete_expired_measurements(
+    conn, retention_hours: Optional[int] = None
+) -> int:
+    hours = retention_hours or int(
+        os.getenv("MEASUREMENT_RETENTION_HOURS", "72")
+    )
+    if hours <= 0:
+        raise ValueError("MEASUREMENT_RETENTION_HOURS must be positive")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM air.measurements
+            WHERE ts < CURRENT_TIMESTAMP - (%s * INTERVAL '1 hour')
+            """,
+            (hours,),
+        )
+        deleted = cur.rowcount
+    conn.commit()
+    print(
+        f"[retention] deleted {deleted} measurements older than {hours} hours"
+    )
+    return deleted
+
+@app.on_event("startup")
+def cleanup_expired_measurements_on_startup():
+    conn = get_db_connection()
+    if not conn:
+        print("[retention] skipped: database connection unavailable")
+        return
+    try:
+        delete_expired_measurements(conn)
+    except Exception as exc:
+        conn.rollback()
+        print(f"[retention] cleanup failed: {exc}")
+    finally:
+        conn.close()
+
 # ================
 #  시간/등급 유틸
 # ================
@@ -301,18 +338,34 @@ async def nearest(
             q = """
             WITH target AS (
               SELECT ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography AS g
+            ),
+            nearby_stations AS (
+              SELECT
+                s.id AS station_id,
+                s.name,
+                s.provider,
+                s.kind,
+                s.lat,
+                s.lon,
+                ST_Distance(s.geom, target.g) AS distance_m
+              FROM air.stations s
+              CROSS JOIN target
+              WHERE s.geom IS NOT NULL
+              ORDER BY distance_m ASC
+              LIMIT 10
             )
             SELECT
-              s.id as station_id,
+              s.station_id,
               s.name,
               s.provider,
               s.kind,
-              s.lat, s.lon,
-              ST_Distance(s.geom, (SELECT g FROM target)) AS distance_m,
+              s.lat,
+              s.lon,
+              s.distance_m,
               current_pm.pm10, current_pm.pm25,
               current_pm.unit_pm10, current_pm.unit_pm25,
               current_pm.display_ts
-            FROM air.stations s
+            FROM nearby_stations s
             JOIN LATERAL (
               SELECT
                 m.pm10,
@@ -329,7 +382,7 @@ async def nearest(
               ORDER BY m.ts DESC
               LIMIT 1
             ) current_pm ON TRUE
-            ORDER BY ST_Distance(s.geom, (SELECT g FROM target)) ASC
+            ORDER BY current_pm.display_ts DESC, s.distance_m ASC
             LIMIT 1;
             """
             with conn.cursor() as cur:
@@ -359,6 +412,7 @@ async def nearest(
                         "gas_source_kind": None,
                         "gas_display_ts": None,
                         "gas_station": None,
+                        "gas_meta": None,
                         "source_kind": row.get("kind"),
                         "lat": row.get("lat"),
                         "lon": row.get("lon"),
@@ -382,12 +436,20 @@ async def nearest(
                     "so2": None,
                     "co": None,
                 }
+                gas_meta = {key: None for key in ("o3", "no2", "so2", "co")}
                 gas_providers = set()
                 try:
                     gas_aq = await cached_fetch_openmeteo(lat, lon, keys=GAS_KEYS)
                     gas.update(_pick_latest(gas_aq))
-                    if any(gas.get(k) is not None for k in ("o3", "no2", "so2", "co")):
-                        gas_providers.add("OPENMETEO")
+                    for key in ("o3", "no2", "so2", "co"):
+                        if gas.get(key) is not None:
+                            gas_providers.add("OPENMETEO")
+                            gas_meta[key] = {
+                                "provider": "OPENMETEO",
+                                "source_kind": "model",
+                                "display_ts": gas.get("display_ts"),
+                                "station": None,
+                            }
                 except Exception as e:
                     print(f"[nearest] Open-Meteo gas supplement failed: {e}")
 
@@ -402,10 +464,30 @@ async def nearest(
                             if owm_gas.get(key) is not None:
                                 gas[key] = owm_gas[key]
                                 gas_providers.add("OWM")
-                        if not gas.get("display_ts"):
-                            gas["display_ts"] = owm_gas.get("display_ts")
+                                gas_meta[key] = {
+                                    "provider": "OWM",
+                                    "source_kind": "model",
+                                    "display_ts": owm_gas.get("display_ts"),
+                                    "station": owm_gas.get("name"),
+                                }
                     except Exception as e:
                         print(f"[nearest] OWM gas backup failed: {e}")
+
+                gas_display_ts = None
+                gas_station = None
+                if len(gas_providers) == 1:
+                    populated_meta = [
+                        meta for meta in gas_meta.values() if meta is not None
+                    ]
+                    timestamps = {
+                        meta.get("display_ts")
+                        for meta in populated_meta
+                        if meta.get("display_ts") is not None
+                    }
+                    if len(timestamps) == 1:
+                        gas_display_ts = next(iter(timestamps))
+                    if gas_providers == {"OWM"}:
+                        gas_station = owm_gas.get("name")
 
                 result = {
                     "provider": row.get("provider"),
@@ -422,8 +504,9 @@ async def nearest(
                     "co": gas.get("co"),
                     "gas_provider": "+".join(sorted(gas_providers)) or None,
                     "gas_source_kind": "model" if gas_providers else None,
-                    "gas_display_ts": gas.get("display_ts"),
-                    "gas_station": owm_gas.get("name") if "OWM" in gas_providers else None,
+                    "gas_display_ts": gas_display_ts,
+                    "gas_station": gas_station,
+                    "gas_meta": gas_meta,
                     "source_kind": row.get("kind"),
                     "lat": row.get("lat"), "lon": row.get("lon"),
                     "station": {
@@ -451,11 +534,32 @@ async def nearest(
     # 폴백( model 또는 auto )
     aq = await cached_fetch_openmeteo(lat, lon, keys=POLLUTANT_KEYS)
     latest = _pick_latest(aq)
+    model_display_ts = (
+        latest["display_ts"] + ":00"
+        if latest.get("display_ts") and len(latest["display_ts"]) == 16
+        else latest.get("display_ts")
+    )
+    gas_meta = {
+        key: (
+            {
+                "provider": "OPENMETEO",
+                "source_kind": "model",
+                "display_ts": model_display_ts,
+                "station": None,
+            }
+            if latest.get(key) is not None
+            else None
+        )
+        for key in ("o3", "no2", "so2", "co")
+    }
+    has_model_gas = any(
+        latest.get(key) is not None for key in ("o3", "no2", "so2", "co")
+    )
     return {
         "provider": "OPENMETEO",
         "name": f"OpenMeteo({round(lat,4)},{round(lon,4)})",
         "station_id": 0,
-        "display_ts": (latest["display_ts"] + ":00") if (latest.get("display_ts") and len(latest["display_ts"]) == 16) else latest.get("display_ts"),
+        "display_ts": model_display_ts,
         "pm10": latest["pm10"],
         "pm25": latest["pm25"],
         "unit_pm10": "µg/m³",
@@ -464,8 +568,11 @@ async def nearest(
         "no2": latest["no2"],
         "so2": latest["so2"],
         "co": latest["co"],
-        "gas_provider": "OPENMETEO",
-        "gas_source_kind": "model",
+        "gas_provider": "OPENMETEO" if has_model_gas else None,
+        "gas_source_kind": "model" if has_model_gas else None,
+        "gas_display_ts": model_display_ts if has_model_gas else None,
+        "gas_station": None,
+        "gas_meta": gas_meta,
         "source_kind": "model",
         "lat": lat, "lon": lon,
         "station": {"name": "Open-Meteo", "provider": "OPENMETEO", "kind": "model"},
