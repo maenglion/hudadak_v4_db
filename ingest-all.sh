@@ -26,7 +26,6 @@ run_optional() {
 echo "== air data ingestion started =="
 run_optional "OWM" "ingest_owm.py"
 run_core "WAQI" "ingest_waqi.py"
-run_core "AIRKOREA" "ingest_airkorea.py"
 run_optional "OPENAQ" "ingest_openaq.py"
 run_optional "FIRMS" "ingest_firms.py"
 
@@ -35,7 +34,7 @@ if ! python /app/cleanup_measurements.py; then
 fi
 
 if (( core_success == 0 )); then
-  echo "ingestion failed: neither WAQI nor AIRKOREA completed successfully" >&2
+  echo "ingestion failed: WAQI did not complete successfully" >&2
   exit 1
 fi
 

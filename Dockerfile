@@ -6,6 +6,7 @@ WORKDIR /app
 COPY requirements-ingest.txt .
 RUN pip install --no-cache-dir -r requirements-ingest.txt
 
-COPY ingest-all.sh cleanup_measurements.py ingest_*.py /app/
+COPY ingest-all.sh airkorea-hourly.sh cleanup_measurements.py \
+    airkorea_common.py sync_airkorea_stations.py ingest_*.py /app/
 
 ENTRYPOINT ["/bin/bash", "/app/ingest-all.sh"]
