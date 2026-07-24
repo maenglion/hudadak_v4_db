@@ -74,6 +74,12 @@ class IngesterTests(unittest.TestCase):
             "AIRKOREA_인천_송도",
         )
 
+    def test_airkorea_midnight_24_hour_timestamp_rolls_to_next_day(self):
+        observed_at = airkorea_common.parse_observed_at(
+            "2026-07-24 24:00"
+        )
+        self.assertEqual(observed_at.isoformat(), "2026-07-25T00:00:00+09:00")
+
     def test_station_list_filters_to_requested_metropolitan_region(self):
         self.assertTrue(
             airkorea_common.station_belongs_to_region(

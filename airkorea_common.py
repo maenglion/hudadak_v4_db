@@ -1,7 +1,7 @@
 import os
 import re
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
@@ -151,6 +151,17 @@ def request_json(conn, url, params, timeout=25, decode_key=False):
 
 
 def parse_observed_at(value):
+    midnight_match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}) 24:(\d{2})", value or ""
+    )
+    if midnight_match:
+        observed_date = datetime.strptime(
+            midnight_match.group(1), "%Y-%m-%d"
+        )
+        return (
+            observed_date
+            + timedelta(days=1, minutes=int(midnight_match.group(2)))
+        ).replace(tzinfo=KST)
     return datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=KST)
 
 
