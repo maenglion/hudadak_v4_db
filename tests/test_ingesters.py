@@ -80,6 +80,11 @@ class IngesterTests(unittest.TestCase):
                 "광주", {"addr": "광주광역시 북구 첨단과기로"}
             )
         )
+        self.assertTrue(
+            airkorea_common.station_belongs_to_region(
+                "광주", {"addr": "광주 북구 첨단과기로"}
+            )
+        )
         self.assertFalse(
             airkorea_common.station_belongs_to_region(
                 "광주", {"addr": "경기도 광주시 중앙로"}
