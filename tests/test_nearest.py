@@ -6,9 +6,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 
-APP_DIR = Path(__file__).resolve().parents[1] / "app"
+ROOT_DIR = Path(__file__).resolve().parents[1]
+APP_DIR = ROOT_DIR / "app"
+sys.path.insert(0, str(ROOT_DIR))
 sys.path.insert(0, str(APP_DIR))
 
+import cleanup_measurements
 import main
 from fastapi import HTTPException
 
@@ -231,7 +234,7 @@ class NearestTests(unittest.TestCase):
     def test_retention_deletes_only_measurements_older_than_72_hours(self):
         connection = RetentionConnection(deleted=4)
 
-        deleted = main.delete_expired_measurements(connection)
+        deleted = cleanup_measurements.delete_expired_measurements(connection)
 
         self.assertEqual(deleted, 4)
         self.assertTrue(connection.committed)

@@ -1,87 +1,160 @@
-gcloud config set project rhythme-1983
-gcloud sql instances describe rhythme-postgres --format="value(connectionName)"
-# --- DB 연결 설정 (Cloud SQL 소켓 방식) ---
-import os, psycopg2
-DBNAME = os.getenv("DBNAME", "hudadak_air")
-DBUSER = os.getenv("DBUSER", "hudadak_admin")
-DBHOST = os.getenv("DBHOST", "/cloudsql/hudadak-air:asia-northeast3:hudadak-2025")
-DBPASS = os.getenv("DBPASS")
-# --- 여기까지 ---
+#!/usr/bin/env python3
+import json
+import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-import os, json
-from datetime import datetime, timezone
-import requests, psycopg2
+import psycopg2
+import requests
 
-DBHOST=os.environ['DBHOST']; DBNAME=os.environ['DBNAME']
-DBUSER=os.environ['DBUSER']; DBPASS=os.environ['DBPASS']
-AIRKEY=os.environ.get('AIRKOREA_KEY','')
 
-def to_int(x):
-    try: return int(x)
-    except: return None
+DBHOST = os.environ["DBHOST"]
+DBNAME = os.environ["DBNAME"]
+DBUSER = os.environ["DBUSER"]
+DBPASS = os.environ["DBPASS"]
+AIRKEY = os.environ.get("AIRKOREA_KEY", "")
+STATION_NAME = os.environ.get("AIRKOREA_STATION_NAME", "송도")
+STATION_LAT = float(os.environ.get("AIRKOREA_STATION_LAT", "37.3925"))
+STATION_LON = float(os.environ.get("AIRKOREA_STATION_LON", "126.6399"))
+
+
+def to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 
 def fetch_airkorea_latest(station_name):
-    url="https://apis.data.go.kr/B552584/ArpltnInforInqireSvc/getMsrstnAcctoRltmMesureDnsty"
-    params={
-        "serviceKey": AIRKEY,
-        "returnType":"json",
-        "numOfRows":"1",
-        "pageNo":"1",
-        "stationName": station_name,
-        "dataTerm":"DAILY",
-        "ver":"1.3"
-    }
-    r=requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    response = requests.get(
+        "https://apis.data.go.kr/B552584/ArpltnInforInqireSvc/"
+        "getMsrstnAcctoRltmMesureDnsty",
+        params={
+            "serviceKey": AIRKEY,
+            "returnType": "json",
+            "numOfRows": "1",
+            "pageNo": "1",
+            "stationName": station_name,
+            "dataTerm": "DAILY",
+            "ver": "1.3",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.json()
 
-conn = psycopg2.connect(host=DBHOST, dbname=DBNAME, user=DBUSER, password=DBPASS)
-conn.autocommit=False
-cur=conn.cursor()
 
-# 소스 보장
-cur.execute("""
-INSERT INTO air.sources(code,name,base_url)
-VALUES ('airkorea','AirKorea','https://api.airkorea.or.kr')
-ON CONFLICT (code) DO UPDATE SET name=EXCLUDED.name, base_url=EXCLUDED.base_url;
-""")
+def main():
+    if not AIRKEY:
+        print("AIRKOREA warning: AIRKOREA_KEY is not configured; skipped")
+        return 0
 
-# 스테이션 보장 (샘플: 송도신도시)
-station_name="송도신도시"
-cur.execute("""
-INSERT INTO air.stations(external_code, name, provider, region_si, region_gu, region_dong, source_id)
-VALUES ('STN_0001', %s, 'AirKorea', '인천','연수구','송도동',
-        (SELECT id FROM air.sources WHERE code='airkorea'))
-ON CONFLICT (provider, external_code) DO NOTHING;
-""", (station_name,))
-cur.execute("SELECT id FROM air.stations WHERE provider='AirKorea' AND name=%s LIMIT 1;", (station_name,))
-station_id=cur.fetchone()[0]
+    payload = fetch_airkorea_latest(STATION_NAME)
+    items = payload.get("response", {}).get("body", {}).get("items") or []
+    if not items:
+        raise RuntimeError("AirKorea returned no observations")
+    item = items[0]
+    pm10 = to_int(item.get("pm10Value"))
+    pm25 = to_int(item.get("pm25Value"))
+    if pm10 is None and pm25 is None:
+        raise RuntimeError("AirKorea returned no PM values")
+    observed_at = datetime.strptime(
+        item["dataTime"], "%Y-%m-%d %H:%M"
+    ).replace(tzinfo=ZoneInfo("Asia/Seoul"))
 
-# 데이터 취득 or 목업
-if AIRKEY:
-    j=fetch_airkorea_latest(station_name)
-    items=j["response"]["body"]["items"]
-    item=items[0]
-    pm10=to_int(item.get("pm10Value")); pm25=to_int(item.get("pm25Value"))
-    g10=to_int(item.get("pm10Grade"));  g25=to_int(item.get("pm25Grade"))
-    ts_str=item.get("dataTime")  # "YYYY-MM-DD HH:MM"
-    # 서버가 TIMESTAMPTZ이므로 naive로 넣어도 UTC 저장
-    from datetime import datetime
-    ts=datetime.strptime(ts_str,"%Y-%m-%d %H:%M")
-    raw=json.dumps(item)
-else:
-    # 키 없으면 목업 1건
-    ts=datetime.utcnow()
-    pm10,pm25,g10,g25,raw=40,17,2,1,json.dumps({"mock":True})
+    conn = psycopg2.connect(
+        host=DBHOST, dbname=DBNAME, user=DBUSER, password=DBPASS
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO air.sources(code,name,base_url,kind)
+                VALUES (
+                    'airkorea','AirKorea','https://apis.data.go.kr','observed'
+                )
+                ON CONFLICT (code) DO UPDATE SET
+                    name=EXCLUDED.name,
+                    base_url=EXCLUDED.base_url,
+                    kind=EXCLUDED.kind
+                """
+            )
+            external_code = f"AIRKOREA_{STATION_NAME}"
+            cur.execute(
+                """
+                INSERT INTO air.stations(
+                    external_code, name, provider, kind, region_si, region_gu,
+                    region_dong, lat, lon, geom, source_id
+                )
+                VALUES (
+                    %s, %s, 'AIRKOREA', 'airkorea_station',
+                    '인천', '연수구', %s, %s, %s,
+                    ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+                    (SELECT id FROM air.sources WHERE code='airkorea')
+                )
+                ON CONFLICT (provider, external_code) DO UPDATE SET
+                    name=EXCLUDED.name,
+                    kind=EXCLUDED.kind,
+                    lat=EXCLUDED.lat,
+                    lon=EXCLUDED.lon,
+                    geom=EXCLUDED.geom,
+                    source_id=EXCLUDED.source_id
+                """,
+                (
+                    external_code,
+                    STATION_NAME,
+                    STATION_NAME,
+                    STATION_LAT,
+                    STATION_LON,
+                    STATION_LON,
+                    STATION_LAT,
+                ),
+            )
+            cur.execute(
+                """
+                SELECT id FROM air.stations
+                WHERE provider='AIRKOREA' AND external_code=%s
+                """,
+                (external_code,),
+            )
+            station_id = cur.fetchone()[0]
+            cur.execute(
+                """
+                INSERT INTO air.measurements(
+                    station_id, ts, pm10, pm25, pm10_grade, pm25_grade, raw,
+                    source_id, source_quality, unit_pm10, unit_pm25,
+                    aqi_provider
+                )
+                VALUES (
+                    %s,%s,%s,%s,%s,%s,%s::jsonb,
+                    (SELECT id FROM air.sources WHERE code='airkorea'),
+                    'observed','ug/m3','ug/m3','AIRKOREA'
+                )
+                ON CONFLICT (station_id, ts) DO UPDATE SET
+                    pm10=EXCLUDED.pm10,
+                    pm25=EXCLUDED.pm25,
+                    pm10_grade=EXCLUDED.pm10_grade,
+                    pm25_grade=EXCLUDED.pm25_grade,
+                    raw=EXCLUDED.raw,
+                    source_quality=EXCLUDED.source_quality,
+                    aqi_provider=EXCLUDED.aqi_provider
+                """,
+                (
+                    station_id,
+                    observed_at,
+                    pm10,
+                    pm25,
+                    to_int(item.get("pm10Grade")),
+                    to_int(item.get("pm25Grade")),
+                    json.dumps(item),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    print("AIRKOREA OK: 1 observation")
+    return 1
 
-cur.execute("""
-INSERT INTO air.measurements(station_id, ts, pm10, pm25, pm10_grade, pm25_grade, raw, source_id)
-VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,(SELECT id FROM air.sources WHERE code='airkorea'))
-ON CONFLICT (station_id, ts) DO UPDATE
-SET pm10=EXCLUDED.pm10, pm25=EXCLUDED.pm25, pm10_grade=EXCLUDED.pm10_grade,
-    pm25_grade=EXCLUDED.pm25_grade, raw=EXCLUDED.raw;
-""",(station_id, ts, pm10, pm25, g10, g25, raw))
 
-conn.commit()
-cur.close(); conn.close()
-print("Ingest OK.")
+if __name__ == "__main__":
+    main()

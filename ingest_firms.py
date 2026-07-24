@@ -16,9 +16,11 @@ DBHOST = os.getenv("DBHOST")
 DBNAME = os.getenv("DBNAME")
 DBUSER = os.getenv("DBUSER")
 DBPASS = os.getenv("DBPASS")
-KEY = os.getenv("FIRMS_MAP_KEY")
+KEY = os.getenv("FIRMS_MAP_KEY") or os.getenv("NASA_KEY")
 assert DBHOST and DBNAME and DBUSER and DBPASS, "DB* env not set"
-assert KEY, "Set FIRMS_MAP_KEY"
+if not KEY:
+    print("FIRMS warning: FIRMS_MAP_KEY or NASA_KEY is not configured; skipped")
+    raise SystemExit(0)
 
 # 영역(bbox) API (키 필요) + 공개 24h CSV(폴백)
 BBOX     = (126.3, 36.9, 127.8, 38.2)

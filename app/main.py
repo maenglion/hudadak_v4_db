@@ -79,43 +79,6 @@ def get_db_connection():
         print("🔥 DATABASE CONNECTION FAILED:", e)
         return None
 
-def delete_expired_measurements(
-    conn, retention_hours: Optional[int] = None
-) -> int:
-    hours = retention_hours or int(
-        os.getenv("MEASUREMENT_RETENTION_HOURS", "72")
-    )
-    if hours <= 0:
-        raise ValueError("MEASUREMENT_RETENTION_HOURS must be positive")
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            DELETE FROM air.measurements
-            WHERE ts < CURRENT_TIMESTAMP - (%s * INTERVAL '1 hour')
-            """,
-            (hours,),
-        )
-        deleted = cur.rowcount
-    conn.commit()
-    print(
-        f"[retention] deleted {deleted} measurements older than {hours} hours"
-    )
-    return deleted
-
-@app.on_event("startup")
-def cleanup_expired_measurements_on_startup():
-    conn = get_db_connection()
-    if not conn:
-        print("[retention] skipped: database connection unavailable")
-        return
-    try:
-        delete_expired_measurements(conn)
-    except Exception as exc:
-        conn.rollback()
-        print(f"[retention] cleanup failed: {exc}")
-    finally:
-        conn.close()
-
 # ================
 #  시간/등급 유틸
 # ================
