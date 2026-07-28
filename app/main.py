@@ -116,6 +116,31 @@ def generate_badges(air: dict) -> List[str]:
         badges.append("🚨 초미세먼지 심화")
     return badges
 
+
+def _pm_meta(row: dict, pollutant: str) -> Optional[dict]:
+    """Build metadata for one independently selected PM observation."""
+    if row.get(pollutant) is None:
+        return None
+    prefix = f"{pollutant}_"
+    # The fallback keys keep unit-test/fake-row compatibility only; the live
+    # query always aliases pollutant-specific metadata.
+    return {
+        "provider": row.get(prefix + "provider", row.get("provider")),
+        "station": row.get(prefix + "station", row.get("name")),
+        "station_id": row.get(prefix + "station_id", row.get("station_id")),
+        "display_ts": row.get(prefix + "display_ts", row.get("display_ts")),
+        "source_kind": row.get(prefix + "source_kind", row.get("kind")),
+        "lat": row.get(prefix + "lat", row.get("lat")),
+        "lon": row.get(prefix + "lon", row.get("lon")),
+        "distance_m": row.get(prefix + "distance_m", row.get("distance_m")),
+        "unit": row.get(prefix + "unit", row.get("unit_" + pollutant)) or "µg/m³",
+    }
+
+
+def _compat_pm_meta(pm10_meta: Optional[dict], pm25_meta: Optional[dict]) -> dict:
+    """Legacy single-source fields use PM10 metadata, falling back to PM2.5."""
+    return pm10_meta or pm25_meta or {}
+
 app.include_router(geo_router) 
 
 # =======================================
@@ -302,27 +327,60 @@ async def nearest(
             WITH target AS (
               SELECT ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography AS g
             ),
-            nearby_stations AS (
+            pm10_nearby AS (
               SELECT
-                s.id AS station_id,
-                s.name,
-                s.provider,
-                s.kind,
-                s.lat,
-                s.lon,
-                ST_Distance(s.geom, target.g) AS distance_m,
+                s.id AS pm10_station_id,
+                s.name AS pm10_station,
+                s.provider AS pm10_provider,
+                s.kind AS pm10_source_kind,
+                s.lat AS pm10_lat,
+                s.lon AS pm10_lon,
+                ST_Distance(s.geom, target.g) AS pm10_distance_m,
                 current_pm.pm10,
-                current_pm.pm25,
-                current_pm.unit_pm10,
-                current_pm.unit_pm25,
-                current_pm.display_ts
+                current_pm.unit_pm10 AS pm10_unit,
+                current_pm.display_ts AS pm10_display_ts
               FROM air.stations s
               CROSS JOIN target
               JOIN LATERAL (
                 SELECT
                   m.pm10,
-                  m.pm25,
                   m.unit_pm10,
+                  m.ts AS display_ts
+                FROM air.measurements m
+                WHERE m.station_id = s.id
+                  AND m.ts <= CURRENT_TIMESTAMP
+                  AND m.ts >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                  AND m.source_quality IS DISTINCT FROM 'model'
+                  AND m.pm10 IS NOT NULL
+                ORDER BY m.ts DESC
+                LIMIT 1
+              ) current_pm ON TRUE
+              WHERE s.geom IS NOT NULL
+              ORDER BY pm10_distance_m ASC
+              LIMIT 10
+            ),
+            pm10_selected AS (
+              SELECT * FROM pm10_nearby
+              ORDER BY pm10_display_ts DESC, pm10_distance_m ASC
+              LIMIT 1
+            ),
+            pm25_nearby AS (
+              SELECT
+                s.id AS pm25_station_id,
+                s.name AS pm25_station,
+                s.provider AS pm25_provider,
+                s.kind AS pm25_source_kind,
+                s.lat AS pm25_lat,
+                s.lon AS pm25_lon,
+                ST_Distance(s.geom, target.g) AS pm25_distance_m,
+                current_pm.pm25,
+                current_pm.unit_pm25 AS pm25_unit,
+                current_pm.display_ts AS pm25_display_ts
+              FROM air.stations s
+              CROSS JOIN target
+              JOIN LATERAL (
+                SELECT
+                  m.pm25,
                   m.unit_pm25,
                   m.ts AS display_ts
                 FROM air.measurements m
@@ -330,28 +388,22 @@ async def nearest(
                   AND m.ts <= CURRENT_TIMESTAMP
                   AND m.ts >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
                   AND m.source_quality IS DISTINCT FROM 'model'
-                  AND (m.pm10 IS NOT NULL OR m.pm25 IS NOT NULL)
+                  AND m.pm25 IS NOT NULL
                 ORDER BY m.ts DESC
                 LIMIT 1
               ) current_pm ON TRUE
               WHERE s.geom IS NOT NULL
-              ORDER BY distance_m ASC
+              ORDER BY pm25_distance_m ASC
               LIMIT 10
+            ),
+            pm25_selected AS (
+              SELECT * FROM pm25_nearby
+              ORDER BY pm25_display_ts DESC, pm25_distance_m ASC
+              LIMIT 1
             )
-            SELECT
-              s.station_id,
-              s.name,
-              s.provider,
-              s.kind,
-              s.lat,
-              s.lon,
-              s.distance_m,
-              s.pm10, s.pm25,
-              s.unit_pm10, s.unit_pm25,
-              s.display_ts
-            FROM nearby_stations s
-            ORDER BY s.display_ts DESC, s.distance_m ASC
-            LIMIT 1;
+            SELECT *
+            FROM pm10_selected
+            FULL OUTER JOIN pm25_selected ON TRUE;
             """
             with conn.cursor() as cur:
                 cur.execute(q, (lon, lat))
@@ -359,19 +411,26 @@ async def nearest(
                 if row and not isinstance(row, dict):
                     cols = [d[0] for d in cur.description]
                     row = dict(zip(cols, row))
-            if row:
+            if row and (row.get("pm10") is not None or row.get("pm25") is not None):
+                pm10_meta = _pm_meta(row, "pm10")
+                pm25_meta = _pm_meta(row, "pm25")
+                # Deprecated compatibility fields intentionally follow PM10,
+                # or PM2.5 when PM10 has no valid observation.
+                compat = _compat_pm_meta(pm10_meta, pm25_meta)
                 # 위젯의 source=db 요청은 DB의 PM 데이터만 반환한다.
                 # 앱의 source=auto 요청은 기존 가스 보충 동작을 유지한다.
                 if source == "db":
                     result = {
-                        "provider": row.get("provider"),
-                        "name": row.get("name"),
-                        "station_id": row.get("station_id"),
-                        "display_ts": row.get("display_ts"),
+                        "provider": compat.get("provider"),
+                        "name": compat.get("station"),
+                        "station_id": compat.get("station_id"),
+                        "display_ts": compat.get("display_ts"),
                         "pm10": row.get("pm10"),
                         "pm25": row.get("pm25"),
-                        "unit_pm10": row.get("unit_pm10") or "µg/m³",
-                        "unit_pm25": row.get("unit_pm25") or "µg/m³",
+                        "unit_pm10": (pm10_meta or {}).get("unit") or "µg/m³",
+                        "unit_pm25": (pm25_meta or {}).get("unit") or "µg/m³",
+                        "pm10_meta": pm10_meta,
+                        "pm25_meta": pm25_meta,
                         "o3": None,
                         "no2": None,
                         "so2": None,
@@ -381,16 +440,17 @@ async def nearest(
                         "gas_display_ts": None,
                         "gas_station": None,
                         "gas_meta": None,
-                        "source_kind": row.get("kind"),
-                        "lat": row.get("lat"),
-                        "lon": row.get("lon"),
+                        "source_kind": compat.get("source_kind"),
+                        "lat": compat.get("lat"),
+                        "lon": compat.get("lon"),
                         "station": {
-                            "name": row.get("name"),
-                            "provider": row.get("provider"),
-                            "kind": row.get("kind"),
+                            "name": compat.get("station"),
+                            "provider": compat.get("provider"),
+                            "kind": compat.get("source_kind"),
                         },
                         "source": "db",
                     }
+                    # Compatibility aggregate may combine different stations/times.
                     result["cai_grade"] = _kr_grade_from_pm(
                         result["pm10"], result["pm25"]
                     )
@@ -458,14 +518,16 @@ async def nearest(
                         gas_station = owm_gas.get("name")
 
                 result = {
-                    "provider": row.get("provider"),
-                    "name": row.get("name"),
-                    "station_id": row.get("station_id"),
-                    "display_ts": row.get("display_ts"),
+                    "provider": compat.get("provider"),
+                    "name": compat.get("station"),
+                    "station_id": compat.get("station_id"),
+                    "display_ts": compat.get("display_ts"),
                     "pm10": row.get("pm10"),
                     "pm25": row.get("pm25"),
-                    "unit_pm10": row.get("unit_pm10") or "µg/m³",
-                    "unit_pm25": row.get("unit_pm25") or "µg/m³",
+                    "unit_pm10": (pm10_meta or {}).get("unit") or "µg/m³",
+                    "unit_pm25": (pm25_meta or {}).get("unit") or "µg/m³",
+                    "pm10_meta": pm10_meta,
+                    "pm25_meta": pm25_meta,
                     "o3": gas.get("o3"),
                     "no2": gas.get("no2"),
                     "so2": gas.get("so2"),
@@ -475,15 +537,16 @@ async def nearest(
                     "gas_display_ts": gas_display_ts,
                     "gas_station": gas_station,
                     "gas_meta": gas_meta,
-                    "source_kind": row.get("kind"),
-                    "lat": row.get("lat"), "lon": row.get("lon"),
+                    "source_kind": compat.get("source_kind"),
+                    "lat": compat.get("lat"), "lon": compat.get("lon"),
                     "station": {
-                        "name": row.get("name"),
-                        "provider": row.get("provider"),
-                        "kind": row.get("kind"),
+                        "name": compat.get("station"),
+                        "provider": compat.get("provider"),
+                        "kind": compat.get("source_kind"),
                     },
                     "source": "db"  # ← 명시
                 }
+                # Compatibility aggregate may combine different stations/times.
                 result["cai_grade"] = _kr_grade_from_pm(result["pm10"], result["pm25"])
                 result["badges"] = generate_badges(result)
                 return result
@@ -523,6 +586,17 @@ async def nearest(
     has_model_gas = any(
         latest.get(key) is not None for key in ("o3", "no2", "so2", "co")
     )
+    model_meta = lambda unit: {
+        "provider": "OPENMETEO",
+        "station": None,
+        "station_id": 0,
+        "display_ts": model_display_ts,
+        "source_kind": "model",
+        "lat": lat,
+        "lon": lon,
+        "distance_m": 0.0,
+        "unit": unit,
+    }
     return {
         "provider": "OPENMETEO",
         "name": f"OpenMeteo({round(lat,4)},{round(lon,4)})",
@@ -532,6 +606,8 @@ async def nearest(
         "pm25": latest["pm25"],
         "unit_pm10": "µg/m³",
         "unit_pm25": "µg/m³",
+        "pm10_meta": model_meta("µg/m³") if latest["pm10"] is not None else None,
+        "pm25_meta": model_meta("µg/m³") if latest["pm25"] is not None else None,
         "o3": latest["o3"],
         "no2": latest["no2"],
         "so2": latest["so2"],

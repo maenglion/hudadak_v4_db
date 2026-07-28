@@ -89,37 +89,45 @@ class MeasurementCursor(FakeCursor):
         normalized_query = " ".join(query.split())
         assert "FROM air.measurements m" in normalized_query
         assert "JOIN LATERAL" in normalized_query
-        assert "nearby_stations AS" in normalized_query
-        assert "ORDER BY distance_m ASC LIMIT 10" in normalized_query
+        assert "pm10_nearby AS" in normalized_query
+        assert "pm25_nearby AS" in normalized_query
         assert "m.ts <= CURRENT_TIMESTAMP" in normalized_query
         assert "m.source_quality IS DISTINCT FROM 'model'" in normalized_query
-        assert "(m.pm10 IS NOT NULL OR m.pm25 IS NOT NULL)" in normalized_query
+        assert "m.pm10 IS NOT NULL" in normalized_query
+        assert "m.pm25 IS NOT NULL" in normalized_query
         assert "ORDER BY m.ts DESC" in normalized_query
-        assert "ORDER BY s.display_ts DESC, s.distance_m ASC" in normalized_query
 
-        eligible = [
-            measurement
-            for measurement in self.measurements
-            if measurement["ts"] <= self.current_time
-            and measurement.get("source_quality") != "model"
-            and (
-                measurement.get("pm10") is not None
-                or measurement.get("pm25") is not None
-            )
-        ]
-        if not eligible:
+        eligible = {
+            pollutant: [
+                measurement
+                for measurement in self.measurements
+                if measurement["ts"] <= self.current_time
+                and measurement.get("source_quality") != "model"
+                and measurement.get(pollutant) is not None
+            ]
+            for pollutant in ("pm10", "pm25")
+        }
+        if not any(eligible.values()):
             self.row = None
             return
-
-        latest = max(eligible, key=lambda measurement: measurement["ts"])
-        self.row = {
-            **self.station,
-            "pm10": latest.get("pm10"),
-            "pm25": latest.get("pm25"),
-            "unit_pm10": latest.get("unit_pm10"),
-            "unit_pm25": latest.get("unit_pm25"),
-            "display_ts": latest["ts"],
-        }
+        self.row = {}
+        for pollutant in ("pm10", "pm25"):
+            if not eligible[pollutant]:
+                self.row[pollutant] = None
+                continue
+            latest = max(eligible[pollutant], key=lambda item: item["ts"])
+            self.row.update({
+                pollutant: latest[pollutant],
+                f"{pollutant}_unit": latest.get(f"unit_{pollutant}"),
+                f"{pollutant}_display_ts": latest["ts"],
+                f"{pollutant}_station_id": self.station["station_id"],
+                f"{pollutant}_station": self.station["name"],
+                f"{pollutant}_provider": self.station["provider"],
+                f"{pollutant}_source_kind": self.station["kind"],
+                f"{pollutant}_lat": self.station["lat"],
+                f"{pollutant}_lon": self.station["lon"],
+                f"{pollutant}_distance_m": self.station["distance_m"],
+            })
 
 
 class MeasurementConnection(FakeConnection):
@@ -145,54 +153,52 @@ class CandidateCursor(FakeCursor):
     def execute(self, query, params):
         super().execute(query, params)
         normalized_query = " ".join(query.split())
-        assert "nearby_stations AS" in normalized_query
-        assert "ORDER BY distance_m ASC LIMIT 10" in normalized_query
+        assert "pm10_nearby AS" in normalized_query
+        assert "pm25_nearby AS" in normalized_query
         assert "m.ts <= CURRENT_TIMESTAMP" in normalized_query
         assert "m.source_quality IS DISTINCT FROM 'model'" in normalized_query
-        assert "(m.pm10 IS NOT NULL OR m.pm25 IS NOT NULL)" in normalized_query
-        assert "ORDER BY s.display_ts DESC, s.distance_m ASC" in normalized_query
-
-        candidates = []
-        for station in self.stations:
-            eligible = [
-                measurement
-                for measurement in self.measurements
-                if measurement["station_id"] == station["station_id"]
-                and measurement["ts"] <= self.current_time
-                and measurement.get("source_quality") != "model"
-                and (
-                    measurement.get("pm10") is not None
-                    or measurement.get("pm25") is not None
-                )
-            ]
-            if not eligible:
+        self.row = {}
+        for pollutant in ("pm10", "pm25"):
+            candidates = []
+            for station in self.stations:
+                eligible = [
+                    measurement
+                    for measurement in self.measurements
+                    if measurement["station_id"] == station["station_id"]
+                    and measurement["ts"] <= self.current_time
+                    and measurement.get("source_quality") != "model"
+                    and measurement.get(pollutant) is not None
+                ]
+                if eligible:
+                    latest = max(eligible, key=lambda item: item["ts"])
+                    candidates.append((station, latest))
+            candidates = sorted(
+                candidates, key=lambda item: item[0]["distance_m"]
+            )[:10]
+            if not candidates:
+                self.row[pollutant] = None
                 continue
-            latest = max(eligible, key=lambda measurement: measurement["ts"])
-            candidates.append(
-                {
-                    **station,
-                    "pm10": latest.get("pm10"),
-                    "pm25": latest.get("pm25"),
-                    "unit_pm10": latest.get("unit_pm10"),
-                    "unit_pm25": latest.get("unit_pm25"),
-                    "display_ts": latest["ts"],
-                }
-            )
-
-        candidates = sorted(
-            candidates, key=lambda candidate: candidate["distance_m"]
-        )[:10]
-        self.row = (
-            max(
+            station, latest = max(
                 candidates,
-                key=lambda candidate: (
-                    candidate["display_ts"],
-                    -candidate["distance_m"],
+                key=lambda item: (
+                    item[1]["ts"],
+                    -item[0]["distance_m"],
                 ),
             )
-            if candidates
-            else None
-        )
+            self.row.update({
+                pollutant: latest[pollutant],
+                f"{pollutant}_unit": latest.get(f"unit_{pollutant}"),
+                f"{pollutant}_display_ts": latest["ts"],
+                f"{pollutant}_station_id": station["station_id"],
+                f"{pollutant}_station": station["name"],
+                f"{pollutant}_provider": station["provider"],
+                f"{pollutant}_source_kind": station["kind"],
+                f"{pollutant}_lat": station["lat"],
+                f"{pollutant}_lon": station["lon"],
+                f"{pollutant}_distance_m": station["distance_m"],
+            })
+        if not any(self.row.get(p) is not None for p in ("pm10", "pm25")):
+            self.row = None
 
 
 class CandidateConnection(FakeConnection):
@@ -703,6 +709,111 @@ class NearestTests(unittest.TestCase):
 
         self.assertEqual(response["provider"], "WAQI")
         self.assertEqual(response["name"], "Aam, Incheon")
+
+    def test_pm10_and_pm25_return_independent_metadata(self):
+        row = {
+            "pm10": 36.0,
+            "pm10_unit": "ug/m3",
+            "pm10_provider": "AIRKOREA",
+            "pm10_station": "인천 신흥",
+            "pm10_station_id": 91412,
+            "pm10_display_ts": "2026-07-28T14:00:00+09:00",
+            "pm10_source_kind": "airkorea_station",
+            "pm10_lat": 37.4,
+            "pm10_lon": 126.62,
+            "pm10_distance_m": 6362.6,
+            "pm25": 72.0,
+            "pm25_unit": "ug/m3",
+            "pm25_provider": "WAQI",
+            "pm25_station": "Aam, Incheon",
+            "pm25_station_id": 91221,
+            "pm25_display_ts": "2026-07-28T13:00:00+09:00",
+            "pm25_source_kind": "waqi_station",
+            "pm25_lat": 37.40508,
+            "pm25_lon": 126.63227,
+            "pm25_distance_m": 1412.2,
+        }
+        with patch.object(
+            main, "get_db_connection", return_value=FakeConnection(row)
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.4102, lon=126.6177, source="db")
+            )
+
+        self.assertEqual(response["pm10_meta"]["provider"], "AIRKOREA")
+        self.assertEqual(response["pm25_meta"]["provider"], "WAQI")
+        self.assertNotEqual(
+            response["pm10_meta"]["display_ts"],
+            response["pm25_meta"]["display_ts"],
+        )
+        self.assertEqual(response["provider"], "AIRKOREA")
+        self.assertEqual(response["name"], "인천 신흥")
+
+    def test_pm10_only_returns_200_shape_with_null_pm25_meta(self):
+        row = {
+            **self.stored_row,
+            "pm25": None,
+        }
+        with patch.object(
+            main, "get_db_connection", return_value=FakeConnection(row)
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="db")
+            )
+        self.assertEqual(response["pm10"], 31.0)
+        self.assertIsNone(response["pm25"])
+        self.assertIsNotNone(response["pm10_meta"])
+        self.assertIsNone(response["pm25_meta"])
+
+    def test_pm25_only_returns_200_shape_with_null_pm10_meta(self):
+        row = {
+            **self.stored_row,
+            "pm10": None,
+        }
+        with patch.object(
+            main, "get_db_connection", return_value=FakeConnection(row)
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="db")
+            )
+        self.assertIsNone(response["pm10"])
+        self.assertEqual(response["pm25"], 14.0)
+        self.assertIsNone(response["pm10_meta"])
+        self.assertIsNotNone(response["pm25_meta"])
+        self.assertEqual(response["provider"], "WAQI")
+
+    def test_source_auto_keeps_same_pm_metadata_as_db(self):
+        row = {
+            **self.stored_row,
+            "pm10_provider": "AIRKOREA",
+            "pm10_station": "신흥",
+            "pm10_station_id": 10,
+            "pm10_display_ts": "2026-07-28T14:00:00+09:00",
+            "pm10_source_kind": "airkorea_station",
+            "pm25_provider": "WAQI",
+            "pm25_station": "Aam",
+            "pm25_station_id": 20,
+            "pm25_display_ts": "2026-07-28T13:00:00+09:00",
+            "pm25_source_kind": "waqi_station",
+        }
+        empty_gas = {"hourly": {"time": [], "ozone": [], "nitrogen_dioxide": [],
+                                "sulphur_dioxide": [], "carbon_monoxide": []}}
+        with (
+            patch.object(
+                main, "get_db_connection", return_value=FakeConnection(row)
+            ),
+            patch.object(
+                main,
+                "cached_fetch_openmeteo",
+                new=AsyncMock(return_value=empty_gas),
+            ),
+            patch.object(main, "_fetch_owm_gas_backup", return_value={}),
+        ):
+            auto = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="auto")
+            )
+        self.assertEqual(auto["pm10_meta"]["provider"], "AIRKOREA")
+        self.assertEqual(auto["pm25_meta"]["provider"], "WAQI")
 
 
 if __name__ == "__main__":
