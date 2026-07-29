@@ -7,6 +7,12 @@ import psycopg2
 from datetime import datetime, timedelta, timezone
 import os, asyncio, json, httpx
 from routers import geo_router
+from selection import (
+    build_pm_query,
+    no_data_reason,
+    query_params,
+    validate_search_scope,
+)
 
 # --- FastAPI 앱 ---
 app = FastAPI(title="Hudadak Air API", version="1.1")
@@ -133,6 +139,9 @@ def _pm_meta(row: dict, pollutant: str) -> Optional[dict]:
         "lat": row.get(prefix + "lat", row.get("lat")),
         "lon": row.get(prefix + "lon", row.get("lon")),
         "distance_m": row.get(prefix + "distance_m", row.get("distance_m")),
+        "distance_band": row.get(prefix + "distance_band"),
+        "sido_code": row.get(prefix + "sido_code"),
+        "sigungu_code": row.get(prefix + "sigungu_code"),
         "unit": row.get(prefix + "unit", row.get("unit_" + pollutant)) or "µg/m³",
     }
 
@@ -318,95 +327,39 @@ def _fetch_owm_gas_backup(conn, lat: float, lon: float) -> Dict[str, Any]:
 async def nearest(
     lat: float,
     lon: float,
-    source: str = Query("db", pattern="^(db|model|auto)$")  # 기본: db
+    source: str = Query("db", pattern="^(db|model|auto)$"),
+    lookup_mode: str = Query("current", pattern="^(current|search)$"),
+    region_level: Optional[str] = Query(
+        None, pattern="^(sido|sigungu)$"
+    ),
+    region_code: Optional[str] = None,
+    region_name: Optional[str] = None,
 ):
+    # Direct unit-test calls bypass FastAPI's Query value extraction.
+    if not isinstance(lookup_mode, str):
+        lookup_mode = "current"
+    if not isinstance(region_level, str):
+        region_level = None
+    try:
+        validate_search_scope(lookup_mode, region_level, region_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    fallback_reason = None
+    if source == "model":
+        fallback_reason = "MODEL_REQUESTED"
+
     conn = get_db_connection()
-    if conn:
+    if conn and source != "model":
         try:
-            q = """
-            WITH target AS (
-              SELECT ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography AS g
-            ),
-            pm10_nearby AS (
-              SELECT
-                s.id AS pm10_station_id,
-                s.name AS pm10_station,
-                s.provider AS pm10_provider,
-                s.kind AS pm10_source_kind,
-                s.lat AS pm10_lat,
-                s.lon AS pm10_lon,
-                ST_Distance(s.geom, target.g) AS pm10_distance_m,
-                current_pm.pm10,
-                current_pm.unit_pm10 AS pm10_unit,
-                current_pm.display_ts AS pm10_display_ts
-              FROM air.stations s
-              CROSS JOIN target
-              JOIN LATERAL (
-                SELECT
-                  m.pm10,
-                  m.unit_pm10,
-                  m.ts AS display_ts
-                FROM air.measurements m
-                WHERE m.station_id = s.id
-                  AND m.ts <= CURRENT_TIMESTAMP
-                  AND m.ts >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-                  AND m.source_quality IS DISTINCT FROM 'model'
-                  AND m.pm10 IS NOT NULL
-                ORDER BY m.ts DESC
-                LIMIT 1
-              ) current_pm ON TRUE
-              WHERE s.geom IS NOT NULL
-              ORDER BY pm10_distance_m ASC
-              LIMIT 10
-            ),
-            pm10_selected AS (
-              SELECT * FROM pm10_nearby
-              ORDER BY pm10_display_ts DESC, pm10_distance_m ASC
-              LIMIT 1
-            ),
-            pm25_nearby AS (
-              SELECT
-                s.id AS pm25_station_id,
-                s.name AS pm25_station,
-                s.provider AS pm25_provider,
-                s.kind AS pm25_source_kind,
-                s.lat AS pm25_lat,
-                s.lon AS pm25_lon,
-                ST_Distance(s.geom, target.g) AS pm25_distance_m,
-                current_pm.pm25,
-                current_pm.unit_pm25 AS pm25_unit,
-                current_pm.display_ts AS pm25_display_ts
-              FROM air.stations s
-              CROSS JOIN target
-              JOIN LATERAL (
-                SELECT
-                  m.pm25,
-                  m.unit_pm25,
-                  m.ts AS display_ts
-                FROM air.measurements m
-                WHERE m.station_id = s.id
-                  AND m.ts <= CURRENT_TIMESTAMP
-                  AND m.ts >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-                  AND m.source_quality IS DISTINCT FROM 'model'
-                  AND m.pm25 IS NOT NULL
-                ORDER BY m.ts DESC
-                LIMIT 1
-              ) current_pm ON TRUE
-              WHERE s.geom IS NOT NULL
-              ORDER BY pm25_distance_m ASC
-              LIMIT 10
-            ),
-            pm25_selected AS (
-              SELECT * FROM pm25_nearby
-              ORDER BY pm25_display_ts DESC, pm25_distance_m ASC
-              LIMIT 1
-            )
-            SELECT *
-            FROM pm10_selected
-            FULL OUTER JOIN pm25_selected ON TRUE;
-            """
+            q = build_pm_query(lookup_mode, region_level)
             with conn.cursor() as cur:
-                cur.execute(q, (lon, lat))
+                cur.execute(
+                    q,
+                    query_params(
+                        lookup_mode, lon, lat, region_code
+                    ),
+                )
                 row = cur.fetchone()
                 if row and not isinstance(row, dict):
                     cols = [d[0] for d in cur.description]
@@ -449,6 +402,20 @@ async def nearest(
                             "kind": compat.get("source_kind"),
                         },
                         "source": "db",
+                        "lookup_mode": lookup_mode,
+                        "selection_scope": (
+                            {
+                                "type": "administrative_region",
+                                "region_level": region_level,
+                                "region_code": region_code,
+                                "region_name": region_name,
+                            }
+                            if lookup_mode == "search"
+                            else {
+                                "type": "distance_band",
+                                "bands_km": [[0, 10], [10, 25], [25, 50]],
+                            }
+                        ),
                     }
                     # Compatibility aggregate may combine different stations/times.
                     result["cai_grade"] = _kr_grade_from_pm(
@@ -544,23 +511,46 @@ async def nearest(
                         "provider": compat.get("provider"),
                         "kind": compat.get("source_kind"),
                     },
-                    "source": "db"  # ← 명시
+                    "source": "db",
+                    "lookup_mode": lookup_mode,
+                    "selection_scope": (
+                        {
+                            "type": "administrative_region",
+                            "region_level": region_level,
+                            "region_code": region_code,
+                            "region_name": region_name,
+                        }
+                        if lookup_mode == "search"
+                        else {
+                            "type": "distance_band",
+                            "bands_km": [[0, 10], [10, 25], [25, 50]],
+                        }
+                    ),
                 }
                 # Compatibility aggregate may combine different stations/times.
                 result["cai_grade"] = _kr_grade_from_pm(result["pm10"], result["pm25"])
                 result["badges"] = generate_badges(result)
                 return result
+            fallback_reason = no_data_reason(lookup_mode)
         except Exception as e:
             print(f"[nearest] DB query failed → fallback: {e}")
+            fallback_reason = "DB_QUERY_FAILED"
         finally:
             try: conn.close()
             except: pass
 
     # 여기까지 왔다는 건: DB 연결 실패 또는 결과 없음
     if source == "db":
-        # DB만 쓰기로 했으면 폴백 안 하고 '데이터 없음'으로 반환
-        # (프런트에서 필요 시 모델로 별도 호출)
-        raise HTTPException(status_code=204, detail="no db rows")
+        reason = fallback_reason or no_data_reason(lookup_mode)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": reason,
+                "lookup_mode": lookup_mode,
+                "region_level": region_level,
+                "region_code": region_code,
+            },
+        )
 
     # 폴백( model 또는 auto )
     aq = await cached_fetch_openmeteo(lat, lon, keys=POLLUTANT_KEYS)
@@ -620,7 +610,22 @@ async def nearest(
         "source_kind": "model",
         "lat": lat, "lon": lon,
         "station": {"name": "Open-Meteo", "provider": "OPENMETEO", "kind": "model"},
-        "source": "model"  # ← 명시
+        "source": "model",
+        "lookup_mode": lookup_mode,
+        "fallback_reason": fallback_reason or no_data_reason(lookup_mode),
+        "selection_scope": (
+            {
+                "type": "administrative_region",
+                "region_level": region_level,
+                "region_code": region_code,
+                "region_name": region_name,
+            }
+            if lookup_mode == "search"
+            else {
+                "type": "distance_band",
+                "bands_km": [[0, 10], [10, 25], [25, 50]],
+            }
+        ),
     }
 
 # ==========

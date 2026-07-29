@@ -7,8 +7,10 @@ if ! python /app/ingest_airkorea.py; then
   status=1
 fi
 
-if ! python /app/cleanup_measurements.py; then
-  echo "retention error: cleanup failed; collected data remains committed" >&2
+if [[ "${RUN_RETENTION_CLEANUP:-false}" == "true" ]]; then
+  if ! python /app/cleanup_measurements.py; then
+    echo "retention error: cleanup failed; collected data remains committed" >&2
+  fi
 fi
 
 exit "${status}"

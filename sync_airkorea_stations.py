@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from airkorea_common import (
     AIRKOREA_STATION_BASE_URL,
-    TARGET_REGIONS,
+    configured_regions,
     ensure_usage_table,
     get_db_connection,
     request_json,
@@ -58,10 +58,10 @@ def upsert_stations(conn, region, items):
                 """
                 INSERT INTO air.stations(
                     external_code, name, provider, kind, city, country,
-                    lat, lon, geom, source_id
+                    address, lat, lon, geom, source_id
                 )
                 VALUES (
-                    %s,%s,'AIRKOREA','airkorea_station',%s,'KR',%s,%s,
+                    %s,%s,'AIRKOREA','airkorea_station',%s,'KR',%s,%s,%s,
                     ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
                     (SELECT id FROM air.sources WHERE code='airkorea')
                 )
@@ -70,6 +70,7 @@ def upsert_stations(conn, region, items):
                     kind=EXCLUDED.kind,
                     city=EXCLUDED.city,
                     country=EXCLUDED.country,
+                    address=EXCLUDED.address,
                     lat=EXCLUDED.lat,
                     lon=EXCLUDED.lon,
                     geom=EXCLUDED.geom,
@@ -79,6 +80,7 @@ def upsert_stations(conn, region, items):
                     external_code,
                     station_name,
                     region,
+                    (item.get("addr") or "").strip() or None,
                     lat,
                     lon,
                     lon,
@@ -86,6 +88,31 @@ def upsert_stations(conn, region, items):
                 ),
             )
             upserted += 1
+        cur.execute(
+            """
+            WITH mapped AS (
+                SELECT
+                    s.id,
+                    r.code AS sigungu_code,
+                    r.parent_code AS sido_code,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.id
+                        ORDER BY ST_Area(r.geom) ASC, r.code ASC
+                    ) AS rank
+                FROM air.stations s
+                JOIN air.admin_regions r
+                  ON r.level='sigungu'
+                 AND s.provider='AIRKOREA'
+                 AND s.geom IS NOT NULL
+                 AND ST_Covers(r.geom, s.geom::geometry)
+            )
+            UPDATE air.stations s
+            SET sido_code=m.sido_code,
+                sigungu_code=m.sigungu_code
+            FROM mapped m
+            WHERE s.id=m.id AND m.rank=1
+            """
+        )
     conn.commit()
     return upserted, skipped_without_coordinates, skipped_outside_region
 
@@ -111,7 +138,7 @@ def main():
             )
         conn.commit()
 
-        for region in TARGET_REGIONS:
+        for region in configured_regions():
             last_error = None
             for attempt in range(2):
                 try:

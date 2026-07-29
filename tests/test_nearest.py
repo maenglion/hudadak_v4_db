@@ -92,7 +92,7 @@ class MeasurementCursor(FakeCursor):
         assert "pm10_nearby AS" in normalized_query
         assert "pm25_nearby AS" in normalized_query
         assert "m.ts <= CURRENT_TIMESTAMP" in normalized_query
-        assert "m.source_quality IS DISTINCT FROM 'model'" in normalized_query
+        assert "m.source_quality = 'observed'" in normalized_query
         assert "m.pm10 IS NOT NULL" in normalized_query
         assert "m.pm25 IS NOT NULL" in normalized_query
         assert "ORDER BY m.ts DESC" in normalized_query
@@ -156,7 +156,8 @@ class CandidateCursor(FakeCursor):
         assert "pm10_nearby AS" in normalized_query
         assert "pm25_nearby AS" in normalized_query
         assert "m.ts <= CURRENT_TIMESTAMP" in normalized_query
-        assert "m.source_quality IS DISTINCT FROM 'model'" in normalized_query
+        assert "m.source_quality = 'observed'" in normalized_query
+        assert "ST_DWithin(s.geom, target.g, 50000)" in normalized_query
         self.row = {}
         for pollutant in ("pm10", "pm25"):
             candidates = []
@@ -172,17 +173,22 @@ class CandidateCursor(FakeCursor):
                 if eligible:
                     latest = max(eligible, key=lambda item: item["ts"])
                     candidates.append((station, latest))
-            candidates = sorted(
-                candidates, key=lambda item: item[0]["distance_m"]
-            )[:10]
+            candidates = [
+                item
+                for item in candidates
+                if item[0]["distance_m"] <= 50000
+            ]
             if not candidates:
                 self.row[pollutant] = None
                 continue
-            station, latest = max(
+            station, latest = min(
                 candidates,
                 key=lambda item: (
-                    item[1]["ts"],
-                    -item[0]["distance_m"],
+                    1 if item[0]["distance_m"] <= 10000
+                    else 2 if item[0]["distance_m"] <= 25000
+                    else 3,
+                    -item[1]["ts"].timestamp(),
+                    item[0]["distance_m"],
                 ),
             )
             self.row.update({
@@ -468,7 +474,7 @@ class NearestTests(unittest.TestCase):
         self.assertEqual(response["o3"], 45.0)
         self.assertEqual(response["no2"], 12.0)
 
-    def test_source_db_returns_204_when_no_row_exists(self):
+    def test_source_db_returns_explicit_radius_error_when_no_row_exists(self):
         connection = FakeConnection(None)
 
         with (
@@ -481,7 +487,11 @@ class NearestTests(unittest.TestCase):
                 )
 
         openmeteo.assert_not_awaited()
-        self.assertEqual(raised.exception.status_code, 204)
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "NO_OBSERVATION_WITHIN_RADIUS",
+        )
 
     def test_source_db_uses_past_observation_instead_of_future_forecast(self):
         current_time = datetime(2026, 7, 23, 18, 27, tzinfo=timezone(
@@ -649,6 +659,61 @@ class NearestTests(unittest.TestCase):
         self.assertEqual(response["provider"], "WAQI")
         self.assertEqual(response["name"], "Near WAQI")
         self.assertEqual(response["display_ts"], shared_ts)
+
+    def test_fresher_outer_band_cannot_displace_nearer_band(self):
+        current_time = datetime(
+            2026, 7, 23, 18, 30,
+            tzinfo=timezone(timedelta(hours=9)),
+        )
+        stations = [
+            {
+                "station_id": 1,
+                "name": "Near band WAQI",
+                "provider": "WAQI",
+                "kind": "waqi_station",
+                "lat": 37.5,
+                "lon": 127.0,
+                "distance_m": 9000.0,
+            },
+            {
+                "station_id": 2,
+                "name": "Outer band AirKorea",
+                "provider": "AIRKOREA",
+                "kind": "airkorea_station",
+                "lat": 37.6,
+                "lon": 127.1,
+                "distance_m": 11000.0,
+            },
+        ]
+        measurements = [
+            {
+                "station_id": 1,
+                "ts": current_time - timedelta(hours=3),
+                "pm10": 31.0,
+                "pm25": 14.0,
+                "source_quality": "observed",
+            },
+            {
+                "station_id": 2,
+                "ts": current_time - timedelta(minutes=10),
+                "pm10": 19.0,
+                "pm25": 8.0,
+                "source_quality": "observed",
+            },
+        ]
+        connection = CandidateConnection(
+            stations, measurements, current_time
+        )
+
+        with patch.object(
+            main, "get_db_connection", return_value=connection
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="db")
+            )
+
+        self.assertEqual(response["provider"], "WAQI")
+        self.assertEqual(response["name"], "Near band WAQI")
 
     def test_model_only_stations_do_not_displace_observed_candidate(self):
         current_time = datetime(

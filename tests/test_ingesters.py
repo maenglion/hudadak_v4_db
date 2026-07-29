@@ -1,5 +1,6 @@
 import sys
 import unittest
+from unittest.mock import patch
 from datetime import timedelta
 from pathlib import Path
 
@@ -43,12 +44,32 @@ class IngesterTests(unittest.TestCase):
         self.assertIn('run_core "WAQI" "ingest_waqi.py"', script)
         self.assertNotIn('run_core "AIRKOREA"', script)
 
-    def test_airkorea_targets_only_eight_metropolitan_regions(self):
+    def test_airkorea_targets_all_regions_in_configured_tiers(self):
         self.assertEqual(
-            airkorea_common.TARGET_REGIONS,
-            ("서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종"),
+            airkorea_common.REGION_TIERS,
+            {
+                "A": ("서울", "경기", "인천", "부산", "대구"),
+                "B": (
+                    "대전", "광주", "울산", "경남",
+                    "경북", "충남", "충북",
+                ),
+                "C": ("강원", "전북", "전남", "제주", "세종"),
+            },
         )
         self.assertEqual(airkorea_common.DAILY_CALL_HARD_CAP, 400)
+        self.assertEqual(
+            airkorea_common.EXPECTED_DAILY_REALTIME_CALLS, 146
+        )
+        self.assertEqual(
+            airkorea_common.WORST_CASE_WEEKLY_SYNC_DAY_CALLS, 326
+        )
+
+    def test_airkorea_tier_limits_each_execution_to_its_regions(self):
+        with patch.dict("os.environ", {"AIRKOREA_TIER": "B"}, clear=False):
+            self.assertEqual(
+                airkorea_common.configured_regions(),
+                airkorea_common.REGION_TIERS["B"],
+            )
 
     def test_airkorea_uses_one_regional_realtime_endpoint(self):
         self.assertTrue(
@@ -113,6 +134,18 @@ class IngesterTests(unittest.TestCase):
                 {"addr": "전남광주통합특별시 광양시 중마로"},
             )
         )
+        self.assertTrue(
+            airkorea_common.station_belongs_to_region(
+                "전남",
+                {"addr": "전남광주통합특별시 광양시 중마로"},
+            )
+        )
+        self.assertFalse(
+            airkorea_common.station_belongs_to_region(
+                "전남",
+                {"addr": "전남광주통합특별시 북구 첨단과기로"},
+            )
+        )
         self.assertFalse(
             airkorea_common.station_belongs_to_region(
                 "광주",
@@ -128,3 +161,4 @@ class IngesterTests(unittest.TestCase):
             script.index("python /app/ingest_airkorea.py"),
             script.index("python /app/cleanup_measurements.py"),
         )
+        self.assertIn("RUN_RETENTION_CLEANUP", script)

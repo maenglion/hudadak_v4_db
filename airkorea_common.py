@@ -15,15 +15,16 @@ AIRKOREA_BASE_URL = (
 AIRKOREA_STATION_BASE_URL = (
     "https://apis.data.go.kr/B552584/MsrstnInfoInqireSvc"
 )
-TARGET_REGIONS = (
-    "서울",
-    "부산",
-    "대구",
-    "인천",
-    "광주",
-    "대전",
-    "울산",
-    "세종",
+REGION_TIERS = {
+    "A": ("서울", "경기", "인천", "부산", "대구"),
+    "B": ("대전", "광주", "울산", "경남", "경북", "충남", "충북"),
+    "C": ("강원", "전북", "전남", "제주", "세종"),
+}
+TIER_RUNS_PER_DAY = {"A": 12, "B": 8, "C": 6}
+TARGET_REGIONS = tuple(
+    region
+    for tier in ("A", "B", "C")
+    for region in REGION_TIERS[tier]
 )
 REGION_ADDRESS_PREFIXES = {
     "서울": ("서울특별시", "서울 "),
@@ -34,15 +35,54 @@ REGION_ADDRESS_PREFIXES = {
     "대전": ("대전광역시", "대전 "),
     "울산": ("울산광역시", "울산 "),
     "세종": ("세종특별자치시", "세종 "),
+    "경기": ("경기도", "경기 "),
+    "강원": ("강원특별자치도", "강원도", "강원 "),
+    "충북": ("충청북도", "충북 "),
+    "충남": ("충청남도", "충남 "),
+    "전북": ("전북특별자치도", "전라북도", "전북 "),
+    "전남": ("전라남도", "전남 "),
+    "경북": ("경상북도", "경북 "),
+    "경남": ("경상남도", "경남 "),
+    "제주": ("제주특별자치도", "제주 "),
 }
 GWANGJU_CORE_DISTRICTS = {"동구", "서구", "남구", "북구", "광산구"}
 DAILY_CALL_HARD_CAP = 400
+EXPECTED_DAILY_REALTIME_CALLS = sum(
+    len(REGION_TIERS[tier]) * TIER_RUNS_PER_DAY[tier]
+    for tier in REGION_TIERS
+)
+WORST_CASE_WEEKLY_SYNC_DAY_CALLS = (
+    EXPECTED_DAILY_REALTIME_CALLS * 2 + len(TARGET_REGIONS) * 2
+)
 KST = ZoneInfo("Asia/Seoul")
+
+
+def configured_regions():
+    tier = (os.environ.get("AIRKOREA_TIER") or "").strip().upper()
+    if tier:
+        try:
+            return REGION_TIERS[tier]
+        except KeyError as exc:
+            raise RuntimeError(f"Unknown AIRKOREA_TIER: {tier}") from exc
+    requested = [
+        value.strip()
+        for value in (os.environ.get("AIRKOREA_REGIONS") or "").split(",")
+        if value.strip()
+    ]
+    if requested:
+        unknown = sorted(set(requested) - set(TARGET_REGIONS))
+        if unknown:
+            raise RuntimeError(
+                f"Unknown AIRKOREA_REGIONS: {','.join(unknown)}"
+            )
+        return tuple(requested)
+    return TARGET_REGIONS
 
 
 def get_db_connection():
     return psycopg2.connect(
         host=os.environ["DBHOST"],
+        port=int(os.environ.get("DBPORT", "5432")),
         dbname=os.environ["DBNAME"],
         user=os.environ["DBUSER"],
         password=os.environ["DBPASS"],
@@ -65,12 +105,14 @@ def station_belongs_to_region(region, item):
     address = unicodedata.normalize(
         "NFKC", str((item or {}).get("addr") or "")
     ).strip()
-    if region == "광주" and address.startswith("전남광주통합특별시 "):
+    if address.startswith("전남광주통합특별시 "):
         address_parts = address.split()
-        return (
-            len(address_parts) > 1
-            and address_parts[1] in GWANGJU_CORE_DISTRICTS
-        )
+        district = address_parts[1] if len(address_parts) > 1 else ""
+        if region == "광주":
+            return district in GWANGJU_CORE_DISTRICTS
+        if region == "전남":
+            return district not in GWANGJU_CORE_DISTRICTS
+        return False
     prefixes = REGION_ADDRESS_PREFIXES.get(region, ())
     return any(address.startswith(prefix) for prefix in prefixes)
 

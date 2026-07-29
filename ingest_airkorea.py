@@ -3,7 +3,7 @@ import json
 
 from airkorea_common import (
     AIRKOREA_BASE_URL,
-    TARGET_REGIONS,
+    configured_regions,
     ensure_usage_table,
     get_db_connection,
     parse_observed_at,
@@ -122,7 +122,7 @@ def main():
             )
         conn.commit()
 
-        for region in TARGET_REGIONS:
+        for region in configured_regions():
             last_error = None
             for attempt in range(2):
                 try:
