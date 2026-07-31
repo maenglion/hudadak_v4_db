@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor
 import psycopg2
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import os, asyncio, json, httpx
 from routers import geo_router
 from selection import (
@@ -88,10 +89,13 @@ def get_db_connection():
 # ================
 #  시간/등급 유틸
 # ================
+SEOUL_TZ = ZoneInfo("Asia/Seoul")
+
+
 def _now_kst_floor_hour() -> datetime:
-    now_utc = datetime.now(timezone.utc)
-    kst = now_utc + timedelta(hours=9)
-    return kst.replace(minute=0, second=0, microsecond=0)
+    return datetime.now(SEOUL_TZ).replace(
+        minute=0, second=0, microsecond=0
+    )
 
 def _kr_grade_from_pm(pm10: Optional[float], pm25: Optional[float]) -> Optional[int]:
     if pm10 is None and pm25 is None:
@@ -174,6 +178,12 @@ GAS_KEYS = [
     "sulphur_dioxide",
     "carbon_monoxide",
 ]
+GAS_API_KEYS = {
+    "o3": "ozone",
+    "no2": "nitrogen_dioxide",
+    "so2": "sulphur_dioxide",
+    "co": "carbon_monoxide",
+}
 
 # 바람/강수 키
 MET_KEYS = [
@@ -235,14 +245,156 @@ async def cached_fetch_weather(lat, lon, keys):
     _cache_set(ck, data, 120)
     return data
 
-def _select_latest_index(times: List[str]) -> Optional[int]:
+def _as_seoul_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=SEOUL_TZ)
+    return parsed.astimezone(SEOUL_TZ)
+
+
+def _select_latest_index(
+    times: List[str],
+    now: Optional[datetime] = None,
+) -> Optional[int]:
     if not times:
         return None
-    kst_hour = _now_kst_floor_hour().isoformat(timespec="minutes")
-    candidate = [i for i, t in enumerate(times) if t <= kst_hour]
-    if candidate:
-        return candidate[-1]
-    return 0
+    current = now or _now_kst_floor_hour()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SEOUL_TZ)
+    else:
+        current = current.astimezone(SEOUL_TZ)
+    candidates = [
+        (parsed, index)
+        for index, value in enumerate(times)
+        if (parsed := _as_seoul_datetime(value)) is not None
+        and parsed <= current
+    ]
+    return max(candidates)[1] if candidates else None
+
+
+def _pick_latest_value(
+    aq_json: Dict[str, Any],
+    key: str,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    hourly = aq_json.get("hourly", {}) if aq_json else {}
+    times: List[str] = hourly.get("time") or []
+    values = hourly.get(key) or []
+    current = now or _now_kst_floor_hour()
+    eligible = []
+    for index, time_value in enumerate(times):
+        parsed = _as_seoul_datetime(time_value)
+        value = values[index] if index < len(values) else None
+        if parsed is None or value is None:
+            continue
+        if current.tzinfo is None:
+            normalized_current = current.replace(tzinfo=SEOUL_TZ)
+        else:
+            normalized_current = current.astimezone(SEOUL_TZ)
+        if parsed <= normalized_current:
+            eligible.append((parsed, index, value))
+    if not eligible:
+        return {"display_ts": None, "value": None}
+    _, index, value = max(eligible)
+    return {"display_ts": times[index], "value": value}
+
+
+def _model_display_ts(value: Optional[str]) -> Optional[str]:
+    if value and len(value) == 16:
+        return value + ":00"
+    return value
+
+
+def _model_pm_meta(
+    lat: float,
+    lon: float,
+    display_ts: Optional[str],
+    unit: str = "µg/m³",
+) -> dict:
+    return {
+        "provider": "OPENMETEO",
+        "station": None,
+        "station_id": 0,
+        "display_ts": _model_display_ts(display_ts),
+        "source_kind": "model",
+        "lat": lat,
+        "lon": lon,
+        "distance_m": 0.0,
+        "unit": unit,
+    }
+
+
+def _observed_gas_meta(row: dict, pollutant: str) -> Optional[dict]:
+    if row.get(pollutant) is None:
+        return None
+    prefix = f"{pollutant}_"
+    return {
+        "provider": row.get(prefix + "provider"),
+        "source_kind": "observed",
+        "display_ts": row.get(prefix + "display_ts"),
+        "station": row.get(prefix + "station"),
+        "station_id": row.get(prefix + "station_id"),
+        "lat": row.get(prefix + "lat"),
+        "lon": row.get(prefix + "lon"),
+        "distance_m": row.get(prefix + "distance_m"),
+    }
+
+
+def _model_gas_meta(
+    lat: float,
+    lon: float,
+    display_ts: Optional[str],
+) -> dict:
+    return {
+        "provider": "OPENMETEO",
+        "source_kind": "model",
+        "display_ts": _model_display_ts(display_ts),
+        "station": None,
+        "station_id": 0,
+        "lat": lat,
+        "lon": lon,
+        "distance_m": 0.0,
+    }
+
+
+def _gas_aggregate(gas_meta: Dict[str, Optional[dict]]) -> dict:
+    populated = [meta for meta in gas_meta.values() if meta]
+    providers = {
+        meta.get("provider") for meta in populated if meta.get("provider")
+    }
+    source_kinds = {
+        meta.get("source_kind")
+        for meta in populated
+        if meta.get("source_kind")
+    }
+    timestamps = {
+        meta.get("display_ts")
+        for meta in populated
+        if meta.get("display_ts")
+    }
+    stations = {
+        meta.get("station")
+        for meta in populated
+        if meta.get("station")
+    }
+    return {
+        "provider": "+".join(sorted(providers)) or None,
+        "source_kind": (
+            next(iter(source_kinds))
+            if len(source_kinds) == 1
+            else "mixed" if source_kinds else None
+        ),
+        "display_ts": (
+            next(iter(timestamps)) if len(timestamps) == 1 else None
+        ),
+        "station": next(iter(stations)) if len(stations) == 1 else None,
+    }
+
 
 def _pick_latest(aq_json: Dict[str, Any]) -> Dict[str, Any]:
     h = aq_json.get("hourly", {}) if aq_json else {}
@@ -328,6 +480,7 @@ async def nearest(
     lat: float,
     lon: float,
     source: str = Query("db", pattern="^(db|model|auto)$"),
+    pm_fallback: bool = False,
     lookup_mode: str = Query("current", pattern="^(current|search)$"),
     region_level: Optional[str] = Query(
         None, pattern="^(sido|sigungu)$"
@@ -340,6 +493,8 @@ async def nearest(
         lookup_mode = "current"
     if not isinstance(region_level, str):
         region_level = None
+    if not isinstance(pm_fallback, bool):
+        pm_fallback = False
     try:
         validate_search_scope(lookup_mode, region_level, region_code)
     except ValueError as exc:
@@ -349,148 +504,199 @@ async def nearest(
     if source == "model":
         fallback_reason = "MODEL_REQUESTED"
 
+    def pm_only_result(
+        pm10_value,
+        pm25_value,
+        pm10_meta,
+        pm25_meta,
+        response_source="db",
+    ):
+        compat = _compat_pm_meta(pm10_meta, pm25_meta)
+        result = {
+            "provider": compat.get("provider"),
+            "name": compat.get("station"),
+            "station_id": compat.get("station_id"),
+            "display_ts": compat.get("display_ts"),
+            "pm10": pm10_value,
+            "pm25": pm25_value,
+            "unit_pm10": (pm10_meta or {}).get("unit") or "µg/m³",
+            "unit_pm25": (pm25_meta or {}).get("unit") or "µg/m³",
+            "pm10_meta": pm10_meta,
+            "pm25_meta": pm25_meta,
+            "o3": None,
+            "no2": None,
+            "so2": None,
+            "co": None,
+            "gas_provider": None,
+            "gas_source_kind": None,
+            "gas_display_ts": None,
+            "gas_station": None,
+            "gas_meta": None,
+            "source_kind": compat.get("source_kind"),
+            "lat": compat.get("lat"),
+            "lon": compat.get("lon"),
+            "station": {
+                "name": compat.get("station"),
+                "provider": compat.get("provider"),
+                "kind": compat.get("source_kind"),
+            },
+            "source": response_source,
+            "lookup_mode": lookup_mode,
+            "selection_scope": (
+                {
+                    "type": "administrative_region",
+                    "region_level": region_level,
+                    "region_code": region_code,
+                    "region_name": region_name,
+                }
+                if lookup_mode == "search"
+                else {
+                    "type": "distance_band",
+                    "bands_km": [[0, 10], [10, 25], [25, 50]],
+                }
+            ),
+        }
+        result["cai_grade"] = _kr_grade_from_pm(
+            result["pm10"], result["pm25"]
+        )
+        result["badges"] = generate_badges(result)
+        return result
+
     conn = get_db_connection()
     if conn and source != "model":
         try:
-            q = build_pm_query(lookup_mode, region_level)
+            include_gases = source == "auto"
+            q = build_pm_query(
+                lookup_mode,
+                region_level,
+                include_gases=include_gases,
+            )
             with conn.cursor() as cur:
                 cur.execute(
                     q,
                     query_params(
-                        lookup_mode, lon, lat, region_code
+                        lookup_mode,
+                        lon,
+                        lat,
+                        region_code,
+                        include_gases=include_gases,
                     ),
                 )
                 row = cur.fetchone()
                 if row and not isinstance(row, dict):
                     cols = [d[0] for d in cur.description]
                     row = dict(zip(cols, row))
-            if row and (row.get("pm10") is not None or row.get("pm25") is not None):
+            has_pm_observation = bool(
+                row
+                and (
+                    row.get("pm10") is not None
+                    or row.get("pm25") is not None
+                )
+            )
+            has_gas_observation = bool(
+                row
+                and source == "auto"
+                and any(row.get(key) is not None for key in GAS_API_KEYS)
+            )
+            if row and (has_pm_observation or has_gas_observation):
                 pm10_meta = _pm_meta(row, "pm10")
                 pm25_meta = _pm_meta(row, "pm25")
                 # Deprecated compatibility fields intentionally follow PM10,
                 # or PM2.5 when PM10 has no valid observation.
-                compat = _compat_pm_meta(pm10_meta, pm25_meta)
                 # 위젯의 source=db 요청은 DB의 PM 데이터만 반환한다.
                 # 앱의 source=auto 요청은 기존 가스 보충 동작을 유지한다.
-                if source == "db":
-                    result = {
-                        "provider": compat.get("provider"),
-                        "name": compat.get("station"),
-                        "station_id": compat.get("station_id"),
-                        "display_ts": compat.get("display_ts"),
-                        "pm10": row.get("pm10"),
-                        "pm25": row.get("pm25"),
-                        "unit_pm10": (pm10_meta or {}).get("unit") or "µg/m³",
-                        "unit_pm25": (pm25_meta or {}).get("unit") or "µg/m³",
-                        "pm10_meta": pm10_meta,
-                        "pm25_meta": pm25_meta,
-                        "o3": None,
-                        "no2": None,
-                        "so2": None,
-                        "co": None,
-                        "gas_provider": None,
-                        "gas_source_kind": None,
-                        "gas_display_ts": None,
-                        "gas_station": None,
-                        "gas_meta": None,
-                        "source_kind": compat.get("source_kind"),
-                        "lat": compat.get("lat"),
-                        "lon": compat.get("lon"),
-                        "station": {
-                            "name": compat.get("station"),
-                            "provider": compat.get("provider"),
-                            "kind": compat.get("source_kind"),
-                        },
-                        "source": "db",
-                        "lookup_mode": lookup_mode,
-                        "selection_scope": (
-                            {
-                                "type": "administrative_region",
-                                "region_level": region_level,
-                                "region_code": region_code,
-                                "region_name": region_name,
-                            }
-                            if lookup_mode == "search"
-                            else {
-                                "type": "distance_band",
-                                "bands_km": [[0, 10], [10, 25], [25, 50]],
-                            }
-                        ),
-                    }
-                    # Compatibility aggregate may combine different stations/times.
-                    result["cai_grade"] = _kr_grade_from_pm(
-                        result["pm10"], result["pm25"]
+                if source == "db" and not pm_fallback:
+                    return pm_only_result(
+                        row.get("pm10"),
+                        row.get("pm25"),
+                        pm10_meta,
+                        pm25_meta,
                     )
-                    result["badges"] = generate_badges(result)
-                    return result
+
+                pm10_value = row.get("pm10")
+                pm25_value = row.get("pm25")
+                model_keys = []
+                if pm10_meta is None:
+                    model_keys.append("pm10")
+                if pm25_meta is None:
+                    model_keys.append("pm2_5")
 
                 gas = {
-                    "display_ts": None,
-                    "o3": None,
-                    "no2": None,
-                    "so2": None,
-                    "co": None,
+                    key: row.get(key) if source == "auto" else None
+                    for key in GAS_API_KEYS
                 }
-                gas_meta = {key: None for key in ("o3", "no2", "so2", "co")}
-                gas_providers = set()
+                gas_meta = {
+                    key: (
+                        _observed_gas_meta(row, key)
+                        if source == "auto"
+                        else None
+                    )
+                    for key in GAS_API_KEYS
+                }
+                for key, api_key in GAS_API_KEYS.items():
+                    if source == "auto" and gas[key] is None:
+                        model_keys.append(api_key)
                 try:
-                    gas_aq = await cached_fetch_openmeteo(lat, lon, keys=GAS_KEYS)
-                    gas.update(_pick_latest(gas_aq))
-                    for key in ("o3", "no2", "so2", "co"):
-                        if gas.get(key) is not None:
-                            gas_providers.add("OPENMETEO")
-                            gas_meta[key] = {
-                                "provider": "OPENMETEO",
-                                "source_kind": "model",
-                                "display_ts": gas.get("display_ts"),
-                                "station": None,
-                            }
+                    model_aq = (
+                        await cached_fetch_openmeteo(
+                            lat,
+                            lon,
+                            keys=model_keys,
+                        )
+                        if model_keys
+                        else {}
+                    )
+                    if pm10_meta is None:
+                        model_pm10 = _pick_latest_value(model_aq, "pm10")
+                        if model_pm10["value"] is not None:
+                            pm10_value = model_pm10["value"]
+                            pm10_meta = _model_pm_meta(
+                                lat,
+                                lon,
+                                model_pm10["display_ts"],
+                            )
+                    if pm25_meta is None:
+                        model_pm25 = _pick_latest_value(model_aq, "pm2_5")
+                        if model_pm25["value"] is not None:
+                            pm25_value = model_pm25["value"]
+                            pm25_meta = _model_pm_meta(
+                                lat,
+                                lon,
+                                model_pm25["display_ts"],
+                            )
+                    for key, api_key in GAS_API_KEYS.items():
+                        if gas[key] is not None:
+                            continue
+                        model_gas = _pick_latest_value(model_aq, api_key)
+                        if model_gas["value"] is None:
+                            continue
+                        gas[key] = model_gas["value"]
+                        gas_meta[key] = _model_gas_meta(
+                            lat,
+                            lon,
+                            model_gas["display_ts"],
+                        )
                 except Exception as e:
-                    print(f"[nearest] Open-Meteo gas supplement failed: {e}")
+                    print(f"[nearest] Open-Meteo supplement failed: {e}")
 
-                # Open-Meteo 호출 실패 또는 일부 결측은 DB에 저장된 최근 OWM
-                # 농도로 채워 앱에 빈 가스 지표가 노출되지 않게 한다.
-                missing_gases = [k for k in ("o3", "no2", "so2", "co") if gas.get(k) is None]
-                owm_gas = {}
-                if missing_gases:
-                    try:
-                        owm_gas = _fetch_owm_gas_backup(conn, lat, lon)
-                        for key in missing_gases:
-                            if owm_gas.get(key) is not None:
-                                gas[key] = owm_gas[key]
-                                gas_providers.add("OWM")
-                                gas_meta[key] = {
-                                    "provider": "OWM",
-                                    "source_kind": "model",
-                                    "display_ts": owm_gas.get("display_ts"),
-                                    "station": owm_gas.get("name"),
-                                }
-                    except Exception as e:
-                        print(f"[nearest] OWM gas backup failed: {e}")
+                if source == "db":
+                    return pm_only_result(
+                        pm10_value,
+                        pm25_value,
+                        pm10_meta,
+                        pm25_meta,
+                    )
 
-                gas_display_ts = None
-                gas_station = None
-                if len(gas_providers) == 1:
-                    populated_meta = [
-                        meta for meta in gas_meta.values() if meta is not None
-                    ]
-                    timestamps = {
-                        meta.get("display_ts")
-                        for meta in populated_meta
-                        if meta.get("display_ts") is not None
-                    }
-                    if len(timestamps) == 1:
-                        gas_display_ts = next(iter(timestamps))
-                    if gas_providers == {"OWM"}:
-                        gas_station = owm_gas.get("name")
+                gas_aggregate = _gas_aggregate(gas_meta)
 
+                compat = _compat_pm_meta(pm10_meta, pm25_meta)
                 result = {
                     "provider": compat.get("provider"),
                     "name": compat.get("station"),
                     "station_id": compat.get("station_id"),
                     "display_ts": compat.get("display_ts"),
-                    "pm10": row.get("pm10"),
-                    "pm25": row.get("pm25"),
+                    "pm10": pm10_value,
+                    "pm25": pm25_value,
                     "unit_pm10": (pm10_meta or {}).get("unit") or "µg/m³",
                     "unit_pm25": (pm25_meta or {}).get("unit") or "µg/m³",
                     "pm10_meta": pm10_meta,
@@ -499,10 +705,10 @@ async def nearest(
                     "no2": gas.get("no2"),
                     "so2": gas.get("so2"),
                     "co": gas.get("co"),
-                    "gas_provider": "+".join(sorted(gas_providers)) or None,
-                    "gas_source_kind": "model" if gas_providers else None,
-                    "gas_display_ts": gas_display_ts,
-                    "gas_station": gas_station,
+                    "gas_provider": gas_aggregate["provider"],
+                    "gas_source_kind": gas_aggregate["source_kind"],
+                    "gas_display_ts": gas_aggregate["display_ts"],
+                    "gas_station": gas_aggregate["station"],
                     "gas_meta": gas_meta,
                     "source_kind": compat.get("source_kind"),
                     "lat": compat.get("lat"), "lon": compat.get("lon"),
@@ -540,7 +746,7 @@ async def nearest(
             except: pass
 
     # 여기까지 왔다는 건: DB 연결 실패 또는 결과 없음
-    if source == "db":
+    if source == "db" and not pm_fallback:
         reason = fallback_reason or no_data_reason(lookup_mode)
         raise HTTPException(
             status_code=404,
@@ -553,58 +759,91 @@ async def nearest(
         )
 
     # 폴백( model 또는 auto )
-    aq = await cached_fetch_openmeteo(lat, lon, keys=POLLUTANT_KEYS)
-    latest = _pick_latest(aq)
-    model_display_ts = (
-        latest["display_ts"] + ":00"
-        if latest.get("display_ts") and len(latest["display_ts"]) == 16
-        else latest.get("display_ts")
+    fallback_keys = (
+        ["pm10", "pm2_5"]
+        if source == "db"
+        else POLLUTANT_KEYS
     )
+    aq = await cached_fetch_openmeteo(lat, lon, keys=fallback_keys)
+    model_pm10 = _pick_latest_value(aq, "pm10")
+    model_pm25 = _pick_latest_value(aq, "pm2_5")
+    if (
+        model_pm10["value"] is None
+        and model_pm25["value"] is None
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "MODEL_PM_UNAVAILABLE",
+                "lookup_mode": lookup_mode,
+            },
+    )
+    pm10_display_ts = _model_display_ts(model_pm10["display_ts"])
+    pm25_display_ts = _model_display_ts(model_pm25["display_ts"])
+    model_gases = {
+        key: _pick_latest_value(aq, api_key)
+        for key, api_key in GAS_API_KEYS.items()
+    }
     gas_meta = {
         key: (
-            {
-                "provider": "OPENMETEO",
-                "source_kind": "model",
-                "display_ts": model_display_ts,
-                "station": None,
-            }
-            if latest.get(key) is not None
+            _model_gas_meta(lat, lon, item["display_ts"])
+            if item["value"] is not None
             else None
         )
-        for key in ("o3", "no2", "so2", "co")
+        for key, item in model_gases.items()
     }
-    has_model_gas = any(
-        latest.get(key) is not None for key in ("o3", "no2", "so2", "co")
+    gas_aggregate = _gas_aggregate(gas_meta)
+    model_display_ts = (
+        pm10_display_ts
+        or pm25_display_ts
+        or gas_aggregate["display_ts"]
     )
-    model_meta = lambda unit: {
-        "provider": "OPENMETEO",
-        "station": None,
-        "station_id": 0,
-        "display_ts": model_display_ts,
-        "source_kind": "model",
-        "lat": lat,
-        "lon": lon,
-        "distance_m": 0.0,
-        "unit": unit,
-    }
+    has_model_gas = any(
+        item["value"] is not None for item in model_gases.values()
+    )
+    if source == "db":
+        return pm_only_result(
+            model_pm10["value"],
+            model_pm25["value"],
+            (
+                _model_pm_meta(lat, lon, model_pm10["display_ts"])
+                if model_pm10["value"] is not None
+                else None
+            ),
+            (
+                _model_pm_meta(lat, lon, model_pm25["display_ts"])
+                if model_pm25["value"] is not None
+                else None
+            ),
+        )
     return {
         "provider": "OPENMETEO",
         "name": f"OpenMeteo({round(lat,4)},{round(lon,4)})",
         "station_id": 0,
         "display_ts": model_display_ts,
-        "pm10": latest["pm10"],
-        "pm25": latest["pm25"],
+        "pm10": model_pm10["value"],
+        "pm25": model_pm25["value"],
         "unit_pm10": "µg/m³",
         "unit_pm25": "µg/m³",
-        "pm10_meta": model_meta("µg/m³") if latest["pm10"] is not None else None,
-        "pm25_meta": model_meta("µg/m³") if latest["pm25"] is not None else None,
-        "o3": latest["o3"],
-        "no2": latest["no2"],
-        "so2": latest["so2"],
-        "co": latest["co"],
+        "pm10_meta": (
+            _model_pm_meta(lat, lon, model_pm10["display_ts"])
+            if model_pm10["value"] is not None
+            else None
+        ),
+        "pm25_meta": (
+            _model_pm_meta(lat, lon, model_pm25["display_ts"])
+            if model_pm25["value"] is not None
+            else None
+        ),
+        "o3": model_gases["o3"]["value"],
+        "no2": model_gases["no2"]["value"],
+        "so2": model_gases["so2"]["value"],
+        "co": model_gases["co"]["value"],
         "gas_provider": "OPENMETEO" if has_model_gas else None,
         "gas_source_kind": "model" if has_model_gas else None,
-        "gas_display_ts": model_display_ts if has_model_gas else None,
+        "gas_display_ts": (
+            gas_aggregate["display_ts"] if has_model_gas else None
+        ),
         "gas_station": None,
         "gas_meta": gas_meta,
         "source_kind": "model",

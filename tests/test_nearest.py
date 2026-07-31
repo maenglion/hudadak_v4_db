@@ -102,6 +102,9 @@ class MeasurementCursor(FakeCursor):
                 measurement
                 for measurement in self.measurements
                 if measurement["ts"] <= self.current_time
+                and measurement["ts"] >= (
+                    self.current_time - timedelta(hours=3)
+                )
                 and measurement.get("source_quality") != "model"
                 and measurement.get(pollutant) is not None
             ]
@@ -369,7 +372,147 @@ class NearestTests(unittest.TestCase):
         )
         self.assertLessEqual(response["display_ts"], current_time)
 
-    def test_airkorea_pm_with_owm_only_gases_keeps_sources_separate(self):
+    def test_eight_hour_observed_o3_is_kept_and_stale_no2_falls_back(self):
+        row = {
+            **self.stored_row,
+            "o3": 52.0,
+            "o3_provider": "WAQI",
+            "o3_station": "Nearby gas station",
+            "o3_station_id": 91,
+            "o3_display_ts": "2026-07-23T04:00:00+09:00",
+            "o3_lat": 37.49,
+            "o3_lon": 127.01,
+            "o3_distance_m": 1500.0,
+            # A 13-hour-old NO2 row is excluded by the SQL and therefore
+            # reaches the response row as missing.
+            "no2": None,
+            "so2": None,
+            "co": None,
+        }
+        model_payload = {
+            "hourly": {
+                "time": ["2026-07-23T12:00"],
+                "nitrogen_dioxide": [18.0],
+                "sulphur_dioxide": [4.0],
+                "carbon_monoxide": [220.0],
+            }
+        }
+        with (
+            patch.object(
+                main,
+                "get_db_connection",
+                return_value=FakeConnection(row),
+            ),
+            patch.object(
+                main,
+                "cached_fetch_openmeteo",
+                new=AsyncMock(return_value=model_payload),
+            ),
+            patch.object(
+                main,
+                "_now_kst_floor_hour",
+                return_value=datetime(
+                    2026, 7, 23, 12, 0, tzinfo=main.SEOUL_TZ
+                ),
+            ),
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="auto")
+            )
+
+        self.assertEqual(response["o3"], 52.0)
+        self.assertEqual(
+            response["gas_meta"]["o3"]["source_kind"], "observed"
+        )
+        self.assertEqual(
+            response["gas_meta"]["o3"]["provider"], "WAQI"
+        )
+        self.assertEqual(response["no2"], 18.0)
+        self.assertEqual(
+            response["gas_meta"]["no2"]["provider"], "OPENMETEO"
+        )
+        self.assertEqual(
+            response["gas_meta"]["no2"]["source_kind"], "model"
+        )
+        self.assertEqual(response["gas_source_kind"], "mixed")
+
+    def test_observed_gases_keep_independent_stations_and_timestamps(self):
+        row = {
+            **self.stored_row,
+            "o3": 41.0,
+            "o3_provider": "WAQI",
+            "o3_station": "Ozone station",
+            "o3_station_id": 31,
+            "o3_display_ts": "2026-07-23T10:00:00+09:00",
+            "no2": 15.0,
+            "no2_provider": "AIRKOREA",
+            "no2_station": "Nitrogen station",
+            "no2_station_id": 32,
+            "no2_display_ts": "2026-07-23T11:00:00+09:00",
+            "so2": 3.0,
+            "so2_provider": "WAQI",
+            "so2_station": "Sulfur station",
+            "so2_station_id": 33,
+            "so2_display_ts": "2026-07-23T09:00:00+09:00",
+            "co": 205.0,
+            "co_provider": "AIRKOREA",
+            "co_station": "Carbon station",
+            "co_station_id": 34,
+            "co_display_ts": "2026-07-23T08:00:00+09:00",
+        }
+        with (
+            patch.object(
+                main,
+                "get_db_connection",
+                return_value=FakeConnection(row),
+            ),
+            patch.object(
+                main, "cached_fetch_openmeteo", new=AsyncMock()
+            ) as openmeteo,
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="auto")
+            )
+
+        openmeteo.assert_not_awaited()
+        self.assertEqual(response["gas_provider"], "AIRKOREA+WAQI")
+        self.assertEqual(response["gas_source_kind"], "observed")
+        self.assertIsNone(response["gas_display_ts"])
+        self.assertIsNone(response["gas_station"])
+        self.assertEqual(
+            response["gas_meta"]["o3"]["station"], "Ozone station"
+        )
+        self.assertEqual(
+            response["gas_meta"]["no2"]["station"], "Nitrogen station"
+        )
+        self.assertNotEqual(
+            response["gas_meta"]["o3"]["display_ts"],
+            response["gas_meta"]["no2"]["display_ts"],
+        )
+
+    def test_future_openmeteo_gas_uses_latest_past_item_value(self):
+        payload = {
+            "hourly": {
+                "time": [
+                    "2026-07-23T11:00",
+                    "2026-07-23T13:00",
+                ],
+                "ozone": [42.0, 999.0],
+            }
+        }
+        selected = main._pick_latest_value(
+            payload,
+            "ozone",
+            now=datetime(
+                2026, 7, 23, 12, 0, tzinfo=main.SEOUL_TZ
+            ),
+        )
+        self.assertEqual(selected["value"], 42.0)
+        self.assertEqual(
+            selected["display_ts"], "2026-07-23T11:00"
+        )
+
+    def test_openmeteo_gas_failure_leaves_only_failed_items_null(self):
         row = {
             **self.stored_row,
             "provider": "AIRKOREA",
@@ -386,15 +529,6 @@ class NearestTests(unittest.TestCase):
                 "carbon_monoxide": [None],
             }
         }
-        owm = {
-            "display_ts": "2026-07-23T11:30:00+09:00",
-            "name": "OpenWeather grid",
-            "o3": 51.0,
-            "no2": 15.0,
-            "so2": 4.0,
-            "co": 240.0,
-        }
-
         with (
             patch.object(main, "get_db_connection", return_value=connection),
             patch.object(
@@ -402,7 +536,7 @@ class NearestTests(unittest.TestCase):
                 "cached_fetch_openmeteo",
                 new=AsyncMock(return_value=gas_payload),
             ),
-            patch.object(main, "_fetch_owm_gas_backup", return_value=owm),
+            patch.object(main, "_fetch_owm_gas_backup") as owm_backup,
             patch.object(main, "_now_kst_floor_hour", return_value=main.datetime(
                 2026, 7, 23, 12, 0
             )),
@@ -412,16 +546,15 @@ class NearestTests(unittest.TestCase):
             )
 
         self.assertEqual(response["provider"], "AIRKOREA")
-        self.assertEqual(response["gas_provider"], "OWM")
-        self.assertEqual(response["gas_station"], "OpenWeather grid")
-        self.assertEqual(response["gas_display_ts"], owm["display_ts"])
+        self.assertIsNone(response["gas_provider"])
+        self.assertIsNone(response["gas_station"])
+        self.assertIsNone(response["gas_display_ts"])
         for key in ("o3", "no2", "so2", "co"):
-            self.assertEqual(response["gas_meta"][key]["provider"], "OWM")
-            self.assertEqual(
-                response["gas_meta"][key]["station"], "OpenWeather grid"
-            )
+            self.assertIsNone(response[key])
+            self.assertIsNone(response["gas_meta"][key])
+        owm_backup.assert_not_called()
 
-    def test_mixed_gases_return_per_pollutant_provider_and_timestamp(self):
+    def test_partial_openmeteo_gases_do_not_discard_valid_items(self):
         connection = FakeConnection(self.stored_row)
         gas_payload = {
             "hourly": {
@@ -432,15 +565,6 @@ class NearestTests(unittest.TestCase):
                 "carbon_monoxide": [None],
             }
         }
-        owm = {
-            "display_ts": "2026-07-23T11:30:00+09:00",
-            "name": "OpenWeather grid",
-            "o3": 50.0,
-            "no2": 12.0,
-            "so2": 5.0,
-            "co": 210.0,
-        }
-
         with (
             patch.object(main, "get_db_connection", return_value=connection),
             patch.object(
@@ -448,7 +572,7 @@ class NearestTests(unittest.TestCase):
                 "cached_fetch_openmeteo",
                 new=AsyncMock(return_value=gas_payload),
             ),
-            patch.object(main, "_fetch_owm_gas_backup", return_value=owm),
+            patch.object(main, "_fetch_owm_gas_backup") as owm_backup,
             patch.object(main, "_now_kst_floor_hour", return_value=main.datetime(
                 2026, 7, 23, 12, 0
             )),
@@ -457,22 +581,22 @@ class NearestTests(unittest.TestCase):
                 main.nearest(lat=37.5, lon=127.0, source="auto")
             )
 
-        self.assertEqual(response["gas_provider"], "OPENMETEO+OWM")
-        self.assertIsNone(response["gas_display_ts"])
+        self.assertEqual(response["gas_provider"], "OPENMETEO")
+        self.assertEqual(
+            response["gas_display_ts"], "2026-07-23T12:00:00"
+        )
         self.assertIsNone(response["gas_station"])
         self.assertEqual(response["gas_meta"]["o3"]["provider"], "OPENMETEO")
         self.assertEqual(response["gas_meta"]["so2"]["provider"], "OPENMETEO")
-        self.assertEqual(response["gas_meta"]["no2"]["provider"], "OWM")
-        self.assertEqual(response["gas_meta"]["co"]["provider"], "OWM")
+        self.assertIsNone(response["gas_meta"]["no2"])
+        self.assertIsNone(response["gas_meta"]["co"])
         self.assertEqual(
-            response["gas_meta"]["o3"]["display_ts"], "2026-07-23T12:00"
-        )
-        self.assertEqual(
-            response["gas_meta"]["no2"]["display_ts"],
-            "2026-07-23T11:30:00+09:00",
+            response["gas_meta"]["o3"]["display_ts"],
+            "2026-07-23T12:00:00",
         )
         self.assertEqual(response["o3"], 45.0)
-        self.assertEqual(response["no2"], 12.0)
+        self.assertIsNone(response["no2"])
+        owm_backup.assert_not_called()
 
     def test_source_db_returns_explicit_radius_error_when_no_row_exists(self):
         connection = FakeConnection(None)
@@ -879,6 +1003,342 @@ class NearestTests(unittest.TestCase):
             )
         self.assertEqual(auto["pm10_meta"]["provider"], "AIRKOREA")
         self.assertEqual(auto["pm25_meta"]["provider"], "WAQI")
+
+    def test_future_openmeteo_hour_is_never_selected(self):
+        now = datetime(
+            2026, 7, 30, 12, 30, tzinfo=main.SEOUL_TZ
+        )
+        payload = {
+            "hourly": {
+                "time": [
+                    "2026-07-30T11:00",
+                    "2026-07-30T13:00",
+                ],
+                "pm10": [18.0, 999.0],
+            }
+        }
+
+        selected = main._pick_latest_value(
+            payload, "pm10", now=now
+        )
+
+        self.assertEqual(selected["value"], 18.0)
+        self.assertEqual(selected["display_ts"], "2026-07-30T11:00")
+
+    def test_observation_exactly_three_hours_old_is_used(self):
+        current_time = datetime(
+            2026, 7, 30, 12, 0, tzinfo=main.SEOUL_TZ
+        )
+        connection = MeasurementConnection(
+            self.stored_row,
+            [{
+                "ts": current_time - timedelta(hours=3),
+                "pm10": 31.0,
+                "pm25": 14.0,
+                "source_quality": "observed",
+            }],
+            current_time,
+        )
+        payload = {"hourly": {"time": []}}
+        with (
+            patch.object(
+                main, "get_db_connection", return_value=connection
+            ),
+            patch.object(
+                main, "cached_fetch_openmeteo",
+                new=AsyncMock(return_value=payload),
+            ),
+            patch.object(
+                main, "_fetch_owm_gas_backup", return_value={}
+            ),
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="auto")
+            )
+
+        self.assertEqual(response["pm10"], 31.0)
+        self.assertEqual(response["pm25"], 14.0)
+        self.assertEqual(response["pm10_meta"]["provider"], "WAQI")
+        self.assertEqual(response["pm25_meta"]["provider"], "WAQI")
+
+    def test_observation_older_than_three_hours_uses_model(self):
+        current_time = datetime(
+            2026, 7, 30, 12, 0, tzinfo=main.SEOUL_TZ
+        )
+        connection = MeasurementConnection(
+            self.stored_row,
+            [{
+                "ts": current_time - timedelta(
+                    hours=3, seconds=1
+                ),
+                "pm10": 31.0,
+                "pm25": 14.0,
+                "source_quality": "observed",
+            }],
+            current_time,
+        )
+        payload = {
+            "hourly": {
+                "time": ["2026-07-30T12:00"],
+                "pm10": [17.0],
+                "pm2_5": [9.0],
+            }
+        }
+        with (
+            patch.object(
+                main, "get_db_connection", return_value=connection
+            ),
+            patch.object(
+                main, "cached_fetch_openmeteo",
+                new=AsyncMock(return_value=payload),
+            ),
+            patch.object(
+                main,
+                "_now_kst_floor_hour",
+                return_value=current_time,
+            ),
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="auto")
+            )
+
+        self.assertEqual(response["pm10"], 17.0)
+        self.assertEqual(response["pm25"], 9.0)
+        self.assertEqual(
+            response["pm10_meta"]["provider"], "OPENMETEO"
+        )
+        self.assertEqual(
+            response["pm25_meta"]["source_kind"], "model"
+        )
+
+    def test_only_future_openmeteo_hours_returns_no_value(self):
+        now = datetime(
+            2026, 7, 30, 12, 30, tzinfo=main.SEOUL_TZ
+        )
+        payload = {
+            "hourly": {
+                "time": ["2026-07-30T13:00"],
+                "pm2_5": [999.0],
+            }
+        }
+
+        selected = main._pick_latest_value(
+            payload, "pm2_5", now=now
+        )
+
+        self.assertIsNone(selected["value"])
+        self.assertIsNone(selected["display_ts"])
+
+    def test_only_future_model_response_is_not_returned_as_current(self):
+        payload = {
+            "hourly": {
+                "time": ["2026-07-30T13:00"],
+                "pm10": [999.0],
+                "pm2_5": [999.0],
+            }
+        }
+        with (
+            patch.object(
+                main, "get_db_connection", return_value=None
+            ),
+            patch.object(
+                main, "cached_fetch_openmeteo",
+                new=AsyncMock(return_value=payload),
+            ),
+            patch.object(
+                main,
+                "_now_kst_floor_hour",
+                return_value=datetime(
+                    2026, 7, 30, 12, 0,
+                    tzinfo=main.SEOUL_TZ,
+                ),
+            ),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(
+                    main.nearest(
+                        lat=37.5, lon=127.0, source="auto"
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(
+            raised.exception.detail["code"], "MODEL_PM_UNAVAILABLE"
+        )
+
+    def test_pm10_observed_pm25_model_fallback_are_independent(self):
+        row = {**self.stored_row, "pm25": None}
+        payload = {
+            "hourly": {
+                "time": ["2026-07-23T12:00"],
+                "pm2_5": [22.0],
+            }
+        }
+        with (
+            patch.object(
+                main, "get_db_connection",
+                return_value=FakeConnection(row),
+            ),
+            patch.object(
+                main, "cached_fetch_openmeteo",
+                new=AsyncMock(return_value=payload),
+            ),
+            patch.object(
+                main, "_fetch_owm_gas_backup", return_value={}
+            ),
+            patch.object(
+                main,
+                "_now_kst_floor_hour",
+                return_value=datetime(
+                    2026, 7, 23, 12, 0, tzinfo=main.SEOUL_TZ
+                ),
+            ),
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="auto")
+            )
+
+        self.assertEqual(response["pm10"], 31.0)
+        self.assertEqual(response["pm10_meta"]["provider"], "WAQI")
+        self.assertEqual(response["pm25"], 22.0)
+        self.assertEqual(
+            response["pm25_meta"]["provider"], "OPENMETEO"
+        )
+        self.assertEqual(
+            response["pm25_meta"]["source_kind"], "model"
+        )
+        self.assertEqual(response["pm25_meta"]["lat"], 37.5)
+        self.assertEqual(response["pm25_meta"]["lon"], 127.0)
+        self.assertIsNone(response["pm25_meta"]["station"])
+
+    def test_pm25_observed_pm10_model_fallback_are_independent(self):
+        row = {**self.stored_row, "pm10": None}
+        payload = {
+            "hourly": {
+                "time": ["2026-07-23T12:00"],
+                "pm10": [44.0],
+            }
+        }
+        with (
+            patch.object(
+                main, "get_db_connection",
+                return_value=FakeConnection(row),
+            ),
+            patch.object(
+                main, "cached_fetch_openmeteo",
+                new=AsyncMock(return_value=payload),
+            ),
+            patch.object(
+                main, "_fetch_owm_gas_backup", return_value={}
+            ),
+            patch.object(
+                main,
+                "_now_kst_floor_hour",
+                return_value=datetime(
+                    2026, 7, 23, 12, 0, tzinfo=main.SEOUL_TZ
+                ),
+            ),
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="auto")
+            )
+
+        self.assertEqual(response["pm10"], 44.0)
+        self.assertEqual(
+            response["pm10_meta"]["provider"], "OPENMETEO"
+        )
+        self.assertEqual(response["pm25"], 14.0)
+        self.assertEqual(response["pm25_meta"]["provider"], "WAQI")
+
+    def test_widget_pm_fallback_matches_app_without_gases(self):
+        row = {**self.stored_row, "pm25": None}
+        payload = {
+            "hourly": {
+                "time": ["2026-07-23T12:00"],
+                "pm2_5": [22.0],
+            }
+        }
+
+        async def request(source, pm_fallback=False):
+            with (
+                patch.object(
+                    main, "get_db_connection",
+                    return_value=FakeConnection(row),
+                ),
+                patch.object(
+                    main, "cached_fetch_openmeteo",
+                    new=AsyncMock(return_value=payload),
+                ),
+                patch.object(
+                    main, "_fetch_owm_gas_backup", return_value={}
+                ),
+                patch.object(
+                    main,
+                    "_now_kst_floor_hour",
+                    return_value=datetime(
+                        2026, 7, 23, 12, 0,
+                        tzinfo=main.SEOUL_TZ,
+                    ),
+                ),
+            ):
+                return await main.nearest(
+                    lat=37.5,
+                    lon=127.0,
+                    source=source,
+                    pm_fallback=pm_fallback,
+                )
+
+        app_response = asyncio.run(request("auto"))
+        widget_response = asyncio.run(request("db", True))
+
+        for key in ("pm10", "pm25", "pm10_meta", "pm25_meta"):
+            self.assertEqual(widget_response[key], app_response[key])
+        self.assertIsNone(widget_response["gas_provider"])
+        self.assertIsNone(widget_response["gas_meta"])
+
+    def test_openmeteo_failure_keeps_valid_observed_pollutant(self):
+        row = {**self.stored_row, "pm25": None}
+        with (
+            patch.object(
+                main, "get_db_connection",
+                return_value=FakeConnection(row),
+            ),
+            patch.object(
+                main,
+                "cached_fetch_openmeteo",
+                new=AsyncMock(side_effect=RuntimeError("offline")),
+            ),
+            patch.object(
+                main, "_fetch_owm_gas_backup", return_value={}
+            ),
+        ):
+            response = asyncio.run(
+                main.nearest(lat=37.5, lon=127.0, source="auto")
+            )
+
+        self.assertEqual(response["pm10"], 31.0)
+        self.assertEqual(response["pm10_meta"]["provider"], "WAQI")
+        self.assertIsNone(response["pm25"])
+        self.assertIsNone(response["pm25_meta"])
+
+    def test_observation_and_openmeteo_failure_propagates_error(self):
+        with (
+            patch.object(
+                main, "get_db_connection",
+                return_value=FakeConnection(None),
+            ),
+            patch.object(
+                main,
+                "cached_fetch_openmeteo",
+                new=AsyncMock(side_effect=RuntimeError("offline")),
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(
+                    main.nearest(
+                        lat=37.5, lon=127.0, source="auto"
+                    )
+                )
 
 
 if __name__ == "__main__":

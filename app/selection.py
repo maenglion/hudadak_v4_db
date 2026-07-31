@@ -1,4 +1,4 @@
-"""Provider-neutral PM observation selection queries."""
+"""Provider-neutral air observation selection queries."""
 
 from typing import Optional
 
@@ -35,7 +35,11 @@ def no_data_reason(lookup_mode: str) -> str:
     )
 
 
-def build_pm_query(lookup_mode: str, region_level: Optional[str]) -> str:
+def build_pm_query(
+    lookup_mode: str,
+    region_level: Optional[str],
+    include_gases: bool = False,
+) -> str:
     if lookup_mode == "search":
         scope_predicate = """
         EXISTS (
@@ -88,7 +92,7 @@ def build_pm_query(lookup_mode: str, region_level: Optional[str]) -> str:
             FROM air.measurements m
             WHERE m.station_id = s.id
               AND m.ts <= CURRENT_TIMESTAMP
-              AND m.ts >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+              AND m.ts >= CURRENT_TIMESTAMP - INTERVAL '3 hours'
               AND m.source_quality = 'observed'
               AND m.{value_column} IS NOT NULL
             ORDER BY m.ts DESC
@@ -106,15 +110,70 @@ def build_pm_query(lookup_mode: str, region_level: Optional[str]) -> str:
         )
         """
 
+    def gas_ctes(pollutant: str) -> str:
+        return f"""
+        {pollutant}_nearby AS (
+          SELECT
+            s.id AS {pollutant}_station_id,
+            s.name AS {pollutant}_station,
+            s.provider AS {pollutant}_provider,
+            s.lat AS {pollutant}_lat,
+            s.lon AS {pollutant}_lon,
+            ST_Distance(s.geom, target.g) AS {pollutant}_distance_m,
+            CASE
+              WHEN ST_Distance(s.geom, target.g) <= 10000 THEN 1
+              WHEN ST_Distance(s.geom, target.g) <= 25000 THEN 2
+              WHEN ST_Distance(s.geom, target.g) <= 50000 THEN 3
+              ELSE NULL
+            END AS {pollutant}_distance_band,
+            current_gas.{pollutant} AS {pollutant},
+            current_gas.display_ts AS {pollutant}_display_ts
+          FROM air.stations s
+          CROSS JOIN target
+          JOIN LATERAL (
+            SELECT
+              m.{pollutant},
+              m.ts AS display_ts
+            FROM air.measurements m
+            WHERE m.station_id = s.id
+              AND m.ts <= CURRENT_TIMESTAMP
+              AND m.ts >= CURRENT_TIMESTAMP - INTERVAL '12 hours'
+              AND m.source_quality = 'observed'
+              AND m.{pollutant} IS NOT NULL
+            ORDER BY m.ts DESC
+            LIMIT 1
+          ) current_gas ON TRUE
+          WHERE s.geom IS NOT NULL
+            AND {scope_predicate}
+        ),
+        {pollutant}_selected AS (
+          SELECT *
+          FROM {pollutant}_nearby
+          ORDER BY
+            {scope_order.replace("display_ts", f"{pollutant}_display_ts").replace("distance_m", f"{pollutant}_distance_m").replace("distance_band", f"{pollutant}_distance_band")}
+          LIMIT 1
+        )
+        """
+
+    gas_pollutants = ("o3", "no2", "so2", "co") if include_gases else ()
+    gas_cte_sql = "".join(
+        f",\n{gas_ctes(pollutant)}" for pollutant in gas_pollutants
+    )
+    gas_join_sql = "".join(
+        f"\nFULL OUTER JOIN {pollutant}_selected ON TRUE"
+        for pollutant in gas_pollutants
+    )
     return f"""
     WITH target AS (
       SELECT ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography AS g
     ),
     {pollutant_ctes("pm10")},
     {pollutant_ctes("pm25")}
+    {gas_cte_sql}
     SELECT *
     FROM pm10_selected
     FULL OUTER JOIN pm25_selected ON TRUE
+    {gas_join_sql}
     """
 
 
@@ -123,8 +182,10 @@ def query_params(
     lon: float,
     lat: float,
     region_code: Optional[str],
+    include_gases: bool = False,
 ):
     params = [lon, lat]
     if lookup_mode == "search":
-        params.extend([region_code, region_code])
+        pollutant_count = 6 if include_gases else 2
+        params.extend([region_code] * pollutant_count)
     return tuple(params)
